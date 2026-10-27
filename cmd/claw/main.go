@@ -11,18 +11,23 @@ import (
 
 type mockProvider struct{ turn int }
 
-func (m *mockProvider) Generate(ctx context.Context, msgs []schema.Message, _ []schema.ToolDefinition) (*schema.Message, error) {
+func (m *mockProvider) Generate(ctx context.Context, msgs []schema.Message, tools []schema.ToolDefinition) (*schema.Message, error) {
+	// 如果工具列表为空，说明这是引擎发起的 Phase 1: Thinking 阶段
+	if len(tools) == 0 {
+		return &schema.Message{Role: schema.RoleAssistant, Content: "【推理中】目标是检查文件。我不能直接盲猜，我需要先调用 bash 工具执行 ls 命令，看看当前目录下有什么，然后再做定夺。"}, nil
+	}
 	m.turn++
 	if m.turn == 1 {
-		return &schema.Message{Role: schema.RoleAssistant, Content: "让我来看看当前目录下有什么文件。", ToolCalls: []schema.ToolCall{{ID: "call_123", Name: "bash", Arguments: []byte(`{"command": "ls -la"}`)}}}, nil
+		// 第一轮 Action：顺着刚才的 Thinking，精准调用工具
+		return &schema.Message{Role: schema.RoleAssistant, Content: "我要执行我刚才计划的步骤了。", ToolCalls: []schema.ToolCall{{ID: "call_123", Name: "bash", Arguments: []byte(`{"command": "ls -la"}`)}}}, nil
 	}
-	return &schema.Message{Role: schema.RoleAssistant, Content: "我看到了文件列表，里面包含 main.go，任务完成！"}, nil
+	return &schema.Message{Role: schema.RoleAssistant, Content: "Content: 根据工具返回的结果，我看到了 main.go，任务圆满完成！"}, nil
 }
 
 type mockRegistry struct{}
 
 func (m *mockRegistry) GetAvailableTools() []schema.ToolDefinition {
-	return nil
+	return []schema.ToolDefinition{{Name: "bash"}}
 }
 func (m *mockRegistry) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
 	// 直接返回一段伪造的终端输出
@@ -33,7 +38,7 @@ func main() {
 	workDir, _ := os.Getwd()
 	provider := &mockProvider{}
 	registry := &mockRegistry{}
-	engine := engine.NewEngine(provider, registry, workDir)
+	engine := engine.NewEngine(provider, registry, workDir, true)
 	err := engine.Run(context.Background(), "帮我检查当前目录的文件")
 	if err != nil {
 		log.Fatalf("引擎崩溃: %v", err)
