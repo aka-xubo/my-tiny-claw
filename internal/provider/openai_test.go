@@ -22,14 +22,14 @@ func responsesTestBody() io.ReadCloser {
 }
 
 func TestOpenAIProviderUsesResponsesEndpoint(t *testing.T) {
-	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/v1")
+	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/openai/v1")
 
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method != http.MethodPost {
 			t.Errorf("请求方法 = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/v1/responses" {
-			t.Errorf("请求路径 = %s, want /v1/responses", r.URL.Path)
+		if r.URL.Path != "/openai/v1/responses" {
+			t.Errorf("请求路径 = %s, want /openai/v1/responses", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
 			t.Errorf("Authorization = %q, want Bearer test-key", got)
@@ -71,7 +71,7 @@ func TestOpenAIProviderUsesResponsesEndpoint(t *testing.T) {
 }
 
 func TestOpenAIProviderEncodesResponsesFunctionCallAndOutput(t *testing.T) {
-	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/v1")
+	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/openai/v1")
 
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		var body struct {
@@ -124,7 +124,7 @@ func TestOpenAIProviderEncodesResponsesFunctionCallAndOutput(t *testing.T) {
 }
 
 func TestOpenAIProviderParsesResponsesFunctionCall(t *testing.T) {
-	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/v1")
+	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/openai/v1")
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,

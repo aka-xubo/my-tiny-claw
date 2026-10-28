@@ -20,7 +20,7 @@ type OpenAIProvider struct {
 	model  string
 }
 
-const defaultBaseURL = "https://coding.gaiaworks.net/v1"
+const defaultBaseURL = "https://coding.gaiaworks.net/openai/v1"
 
 func NewOpenAIProvider(model string) *OpenAIProvider {
 	key := strings.TrimSpace(os.Getenv("CODEX_API_KEY"))
@@ -32,7 +32,7 @@ func NewOpenAIProvider(model string) *OpenAIProvider {
 
 func newOpenAIProvider(model, key string, httpClient option.HTTPClient) *OpenAIProvider {
 	// Responses.New 会在 BaseURL 后追加 /responses，因此 BaseURL 必须指向
-	// API 根路径（例如 https://coding.gaiaworks.net/v1）。
+	// 中转站的 API 根路径（例如 https://coding.gaiaworks.net/openai/v1）。
 	baseURL := strings.TrimSpace(os.Getenv("CODEX_BASE_URL"))
 	if baseURL == "" {
 		baseURL = strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
@@ -41,13 +41,18 @@ func newOpenAIProvider(model, key string, httpClient option.HTTPClient) *OpenAIP
 		baseURL = defaultBaseURL
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
+	// 兼容之前版本给出的旧地址，避免用户 shell 中已有的环境变量继续
+	// 把请求发到 /v1/responses，而 curl 使用的是 /openai/v1/responses。
+	if baseURL == "https://coding.gaiaworks.net/v1" {
+		baseURL = defaultBaseURL
+	}
 
 	model = strings.TrimSpace(model)
 	if model == "" {
 		model = strings.TrimSpace(os.Getenv("CODEX_MODEL"))
 	}
 	if model == "" {
-		model = "gpt-5.6-sol"
+		model = "gpt-6.1-sol"
 	}
 
 	clientOptions := []option.RequestOption{
