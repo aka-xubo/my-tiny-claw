@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -150,6 +151,17 @@ func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, av
 
 	resp, err := p.client.Chat.Completions.New(ctx, params)
 	if err != nil {
+		var apiErr *openai.Error
+		if errors.As(err, &apiErr) {
+			detail := strings.TrimSpace(apiErr.Message)
+			if detail == "" {
+				detail = strings.TrimSpace(apiErr.RawJSON())
+			}
+			return nil, fmt.Errorf(
+				"OpenAI API 请求失败 (%d): %s (type=%s code=%s param=%s): %w",
+				apiErr.StatusCode, detail, apiErr.Type, apiErr.Code, apiErr.Param, err,
+			)
+		}
 		return nil, fmt.Errorf("OpenAI API 请求失败: %w", err)
 	}
 	if len(resp.Choices) == 0 {

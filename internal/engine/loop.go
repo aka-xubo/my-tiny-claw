@@ -76,8 +76,11 @@ func (e *AgentEngine) Run(ctx context.Context, userPormpt string) error {
 				log.Printf(" -> ✅ 工具执行成功 (返回 %d 字节)\n", len(result.Output))
 			}
 			observationMsg := schema.Message{
-				Role:    schema.RoleUser,
-				Content: result.Output,
+				// Chat Completions 要求工具结果使用 tool 角色，并通过
+				// tool_call_id 关联模型刚才发起的调用。
+				Role:       schema.RoleUser,
+				Content:    result.Output,
+				ToolCallID: result.ToolCallID,
 			}
 			contextHistory = append(contextHistory, observationMsg)
 		}
