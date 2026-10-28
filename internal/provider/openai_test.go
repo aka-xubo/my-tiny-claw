@@ -17,15 +17,19 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }
 
-func TestOpenAIProviderUsesChatCompletionsEndpoint(t *testing.T) {
+func responsesTestBody() io.ReadCloser {
+	return io.NopCloser(strings.NewReader(`{"id":"resp-test","object":"response","created_at":1,"status":"completed","model":"gpt-5.6-sol","output":[{"id":"msg-test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}]}`))
+}
+
+func TestOpenAIProviderUsesResponsesEndpoint(t *testing.T) {
 	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/v1")
 
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method != http.MethodPost {
 			t.Errorf("请求方法 = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/v1/chat/completions" {
-			t.Errorf("请求路径 = %s, want /v1/chat/completions", r.URL.Path)
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("请求路径 = %s, want /v1/responses", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
 			t.Errorf("Authorization = %q, want Bearer test-key", got)
@@ -33,6 +37,10 @@ func TestOpenAIProviderUsesChatCompletionsEndpoint(t *testing.T) {
 
 		var body struct {
 			Model string `json:"model"`
+			Input []struct {
+				Role string `json:"role"`
+				Type string `json:"type"`
+			} `json:"input"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("解析请求体失败: %v", err)
@@ -40,11 +48,14 @@ func TestOpenAIProviderUsesChatCompletionsEndpoint(t *testing.T) {
 		if body.Model != "gpt-5.6-sol" {
 			t.Errorf("请求模型 = %q, want gpt-5.6-sol", body.Model)
 		}
+		if len(body.Input) != 1 || body.Input[0].Role != "user" {
+			t.Errorf("请求 input = %+v, want one user message", body.Input)
+		}
 
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)),
+			Body:       responsesTestBody(),
 			Request:    r,
 		}, nil
 	})
@@ -59,48 +70,79 @@ func TestOpenAIProviderUsesChatCompletionsEndpoint(t *testing.T) {
 	}
 }
 
-func TestOpenAIProviderEncodesToolResult(t *testing.T) {
+func TestOpenAIProviderEncodesResponsesFunctionCallAndOutput(t *testing.T) {
 	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/v1")
 
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		var body struct {
-			Messages []struct {
-				Role       string `json:"role"`
-				ToolCallID string `json:"tool_call_id"`
-				Content    string `json:"content"`
-			} `json:"messages"`
+			Input []struct {
+				Type      string `json:"type"`
+				CallID    string `json:"call_id"`
+				Arguments string `json:"arguments"`
+				Output    string `json:"output"`
+			} `json:"input"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("解析请求体失败: %v", err)
 		}
 
-		found := false
-		for _, message := range body.Messages {
-			if message.Role == "tool" {
-				found = true
-				if message.ToolCallID != "call_1" || message.Content != "天气：晴" {
-					t.Errorf("工具消息 = %+v, want tool_call_id=call_1 content=天气：晴", message)
+		var foundCall, foundOutput bool
+		for _, item := range body.Input {
+			switch item.Type {
+			case "function_call":
+				foundCall = true
+				if item.CallID != "call_1" || item.Arguments != `{"city":"北京"}` {
+					t.Errorf("function_call = %+v", item)
+				}
+			case "function_call_output":
+				foundOutput = true
+				if item.CallID != "call_1" || item.Output != "天气：晴" {
+					t.Errorf("function_call_output = %+v", item)
 				}
 			}
 		}
-		if !found {
-			t.Error("请求中没有 role=tool 的消息")
+		if !foundCall || !foundOutput {
+			t.Errorf("请求 input 缺少 function_call 或 function_call_output: %+v", body.Input)
 		}
 
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)),
+			Body:       responsesTestBody(),
 			Request:    r,
 		}, nil
 	})
 
 	p := newOpenAIProvider("gpt-5.6-sol", "test-key", &http.Client{Transport: transport})
 	_, err := p.Generate(context.Background(), []schema.Message{
-		{Role: schema.RoleAssistant, Content: "查询天气", ToolCalls: []schema.ToolCall{{ID: "call_1", Name: "get_weather", Arguments: []byte(`{"city":"北京"}`)}}},
+		{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: "call_1", Name: "get_weather", Arguments: []byte(`{"city":"北京"}`)}}},
 		{Role: schema.RoleUser, ToolCallID: "call_1", Content: "天气：晴"},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
+	}
+}
+
+func TestOpenAIProviderParsesResponsesFunctionCall(t *testing.T) {
+	t.Setenv("CODEX_BASE_URL", "https://coding.gaiaworks.net/v1")
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp-test","object":"response","created_at":1,"status":"completed","model":"gpt-5.6-sol","output":[{"id":"fc-test","type":"function_call","status":"completed","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"北京\"}"}]}`)),
+			Request:    r,
+		}, nil
+	})
+
+	p := newOpenAIProvider("gpt-5.6-sol", "test-key", &http.Client{Transport: transport})
+	got, err := p.Generate(context.Background(), []schema.Message{{Role: schema.RoleUser, Content: "查天气"}}, nil)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if len(got.ToolCalls) != 1 || got.ToolCalls[0].ID != "call_1" || got.ToolCalls[0].Name != "get_weather" {
+		t.Fatalf("工具调用 = %+v", got.ToolCalls)
+	}
+	if string(got.ToolCalls[0].Arguments) != `{"city":"北京"}` {
+		t.Fatalf("工具参数 = %s", got.ToolCalls[0].Arguments)
 	}
 }
