@@ -8,52 +8,22 @@ import (
 
 	"github.com/aka-xubo/my-tiny-claw/internal/engine"
 	"github.com/aka-xubo/my-tiny-claw/internal/provider"
-	"github.com/aka-xubo/my-tiny-claw/internal/schema"
+	"github.com/aka-xubo/my-tiny-claw/internal/tools"
 )
-
-// 伪造的工具注册表 (用于测试 Provider 的工具提取能力)
-type mockRegistry struct{}
-
-func (m *mockRegistry) GetAvailableTools() []schema.ToolDefinition {
-	return []schema.ToolDefinition{
-		{
-			Name:        "get_weather",
-			Description: "获取指定城市的当前天气情况。",
-			InputSchema: map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"city": map[string]interface{}{
-						"type": "string",
-					},
-				},
-				"required": []string{"city"},
-			},
-		},
-	}
-}
-
-func (m *mockRegistry) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
-	log.Printf("  -> [Mock 工具执行] 获取 %s 的天气中...\n", call.Name)
-	return schema.ToolResult{
-		ToolCallID: call.ID,
-		Output:     "API 返回：今天是晴天，气温 25 度。",
-		IsError:    false,
-	}
-}
 
 func main() {
 
 	workDir, _ := os.Getwd()
 	llmProvider := provider.NewOpenAIProvider(os.Getenv("CODEX_MODEL"))
-	// 2. 注入伪造的工具注册表
-	registry := &mockRegistry{}
-
-	// 3. 实例化并运行引擎，开启 EnableThinking = true (开启慢思考阶段！)
-	eng := engine.NewEngine(llmProvider, registry, workDir, true)
-
-	// 设定测试任务
-	prompt := "我想去北京跑步，帮我查查天气适合吗？"
-
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewReadFileTool(workDir))
+	registry.Register(tools.NewWriteFileTool(workDir))
+	registry.Register(tools.NewBashTool(workDir))
+	eng := engine.NewEngine(llmProvider, registry, workDir, false)
+	prompt := ` 请帮我执行以下操作：
+1. 用 bash 查看一下我当前电脑的 Go 版本。
+2. 帮我写一个简单的 helloworld.go 文件，输出 "Hello, my-tiny-claw!"。
+3. 用 bash 编译并运行这个 go 文件，确认它能正常工作。 `
 	err := eng.Run(context.Background(), prompt)
 	if err != nil {
 		log.Fatalf("引擎运行崩溃: %v", err)
