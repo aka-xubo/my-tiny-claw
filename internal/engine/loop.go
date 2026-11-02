@@ -4,86 +4,122 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
+	cctx "github.com/aka-xubo/my-tiny-claw/internal/context"
 	"github.com/aka-xubo/my-tiny-claw/internal/provider"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 	"github.com/aka-xubo/my-tiny-claw/internal/tools"
 )
 
 type AgentEngine struct {
-	Provider       provider.LLMProvider
-	Registry       tools.Registry
-	WorkDir        string //工作区
+	provider       provider.LLMProvider
+	registry       tools.Registry
 	EnableThinking bool
 }
 
-func NewEngine(provider provider.LLMProvider, registry tools.Registry, workDir string, enableThinking bool) *AgentEngine {
+// 【注意】：我们移除了 Engine 层级的 WorkDir，因为 WorkDir 现在应该跟随 Session 走！
+func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking bool) *AgentEngine {
 	return &AgentEngine{
-		Provider:       provider,
-		Registry:       registry,
-		WorkDir:        workDir,
+		provider:       p,
+		registry:       r,
 		EnableThinking: enableThinking,
 	}
 }
 
-func (e *AgentEngine) Run(ctx context.Context, userPormpt string) error {
-	log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", e.WorkDir)
-	log.Printf("[Engine] 慢思考模式 (Thinking Phase): %v\n", e.EnableThinking)
-	turnCount := 0
-	contextHistory := []schema.Message{
-		{Role: schema.RoleSystem, Content: "You are my-tiny-claw, an expert coding assistant. You have full access to tools in the workspace."},
-		{Role: schema.RoleUser, Content: userPormpt},
-	}
+// 【核心改造】: 移除 userPrompt 参数，改为接收一个具体的 Session 实例
+func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter Reporter) error {
+	log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
+
+	// 根据当前 Session 的工作区，动态组装最新的 System Prompt
+	composer := cctx.NewPromptComposer(session.WorkDir)
+	systemMsg := composer.Build()
+
 	for {
-		turnCount++
-		log.Printf("第 %d 轮开始", turnCount)
-		availableTools := e.Registry.GetAvailableTools()
-		//如果开启了深度思考
-		//不放入工具
-		//强制规划
+		availableTools := e.registry.GetAvailableTools()
+
+		// 1. 【上下文组装】: System Prompt + 截取最近的 6 条消息作为 Working Memory
+		// 在实际业务中，由于工具返回结果可能很长，短期工作记忆往往设为 6-10 条足以维系连贯对话
+		workingMemory := session.GetWorkingMemory(6)
+
+		var contextHistory []schema.Message
+		contextHistory = append(contextHistory, systemMsg)
+		contextHistory = append(contextHistory, workingMemory...)
+
+		// 2. ================= Phase 1: Thinking =================
 		if e.EnableThinking {
-			log.Println("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
-			thinkingResp, err := e.Provider.Generate(ctx, contextHistory, nil)
+			if reporter != nil {
+				reporter.OnThinking(ctx)
+			}
+
+			thinkResp, err := e.provider.Generate(ctx, contextHistory, nil)
 			if err != nil {
-				return fmt.Errorf("模型回复失败:%s", err.Error())
+				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
-			if thinkingResp.Content != "" {
-				contextHistory = append(contextHistory, *thinkingResp)
+			if thinkResp.Content != "" {
+				// 将思考过程持久化到 Session 中！
+				session.Append(*thinkResp)
+				// 把它追加到当前这一轮的临时上下文中，供 Action 阶段使用
+				contextHistory = append(contextHistory, *thinkResp)
 			}
 		}
-		// Phase 2: 行动阶段 (Action) - 恢复工具，顺着规划执行
-		log.Println("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...") // 此时的 contextHistory 中已经包含了上一阶段模型自己的 Thinking Trace。
-		// 模型会顺着自己的逻辑，结合恢复的 availableTools 发起精准的工具调用。
-		actionResp, err := e.Provider.Generate(ctx, contextHistory, availableTools)
+
+		// 3. ================= Phase 2: Action =================
+		actionResp, err := e.provider.Generate(ctx, contextHistory, availableTools)
 		if err != nil {
-			return fmt.Errorf("Action 阶段生成失败: %w", err)
+			return fmt.Errorf("Action 阶段失败: %w", err)
 		}
-		// 将模型的响应完整追加到上下文历史中
+
+		// 将大模型的行动响应持久化到 Session 中
+		session.Append(*actionResp)
 		contextHistory = append(contextHistory, *actionResp)
-		if actionResp.Content != "" {
-			fmt.Printf("🤖 [对外回复]: %s\n", actionResp.Content)
+
+		if actionResp.Content != "" && reporter != nil {
+			reporter.OnMessage(ctx, actionResp.Content)
 		}
+
 		if len(actionResp.ToolCalls) == 0 {
-			fmt.Println("[Engine] 本次任务完成，退出循环")
+			// 如果没有工具调用，说明本次任务已完成，打破 ReAct 循环，挂起等待人类的下一条指令
 			break
 		}
-		for _, tool := range actionResp.ToolCalls {
-			log.Printf("执行工具:%s,参数:%s", tool.ID, tool.Arguments)
-			result := e.Registry.Execute(ctx, tool)
-			if result.IsError {
-				log.Printf(" -> ❌ 工具执行失败:%s", result.Output)
-			} else {
-				log.Printf(" -> ✅ 工具执行成功 (返回 %d 字节)\n", len(result.Output))
-			}
-			observationMsg := schema.Message{
-				// Chat Completions 要求工具结果使用 tool 角色，并通过
-				// tool_call_id 关联模型刚才发起的调用。
-				Role:       schema.RoleUser,
-				Content:    result.Output,
-				ToolCallID: result.ToolCallID,
-			}
-			contextHistory = append(contextHistory, observationMsg)
+
+		// 4. ================= 并发执行底层工具 =================
+		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
+		var wg sync.WaitGroup
+
+		for i, toolCall := range actionResp.ToolCalls {
+			wg.Add(1)
+
+			go func(idx int, call schema.ToolCall) {
+				defer wg.Done()
+
+				if reporter != nil {
+					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
+				}
+
+				result := e.registry.Execute(ctx, call)
+
+				if reporter != nil {
+					displayOutput := result.Output
+					if len(displayOutput) > 200 {
+						displayOutput = displayOutput[:200] + "... (已截断)"
+					}
+					reporter.OnToolResult(ctx, call.Name, displayOutput, result.IsError)
+				}
+
+				observationMsgs[idx] = schema.Message{
+					Role:       schema.RoleUser,
+					Content:    result.Output,
+					ToolCallID: call.ID,
+				}
+			}(i, toolCall)
 		}
+
+		wg.Wait()
+
+		// 将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
+		session.Append(observationMsgs...)
 	}
+
 	return nil
 }

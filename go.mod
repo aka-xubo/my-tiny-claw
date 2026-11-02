@@ -2,7 +2,10 @@ module github.com/aka-xubo/my-tiny-claw
 
 go 1.26.2
 
-require github.com/openai/openai-go/v3 v3.89.0
+require (
+	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
+	github.com/openai/openai-go/v3 v3.89.0
+)
 
 require (
 	github.com/coder/websocket v1.8.15 // indirect
