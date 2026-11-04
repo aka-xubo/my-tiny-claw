@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	cctx "github.com/aka-xubo/my-tiny-claw/internal/context"
@@ -18,9 +19,9 @@ type AgentEngine struct {
 	EnableThinking bool
 	PlanMode       bool // 【新增】暴露给外部的计划模式开关
 	compactor      *cctx.Compactor
+	recovery       *cctx.RecoveryManager
 }
 
-// 【注意】：我们移除了 Engine 层级的 WorkDir，因为 WorkDir 现在应该跟随 Session 走！
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, enableThinking bool) *AgentEngine {
 	return &AgentEngine{
 		provider:       p,
@@ -30,6 +31,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, ena
 		// 【初始化压缩器】：为了便于今天的极端测试，将水位线阈值设积极（例如 3000 字符），
 		// 并保护最近的 6 条消息（大约两轮 Turn 的交互）
 		compactor: cctx.NewCompactor(20000, 6),
+		recovery:  cctx.NewRecoveryManager(),
 	}
 }
 
@@ -55,6 +57,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 
 		// 3. 后续的 Provider.Generate 全面使用被保护过的新鲜上下文 (compactedContext)
 		// ================= Phase 1: Thinking =================
+		var currentTurnThinkingContent string
 		if e.EnableThinking {
 			if reporter != nil {
 				reporter.OnThinking(ctx)
@@ -64,7 +67,8 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
 			if thinkResp.Content != "" {
-				session.Append(*thinkResp)
+				//session.Append(*thinkResp)
+				currentTurnThinkingContent = thinkResp.Content
 				compactedContext = append(compactedContext, *thinkResp)
 			}
 		}
@@ -74,10 +78,15 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 		if err != nil {
 			return fmt.Errorf("Action 阶段失败: %w", err)
 		}
+		finalAssistantMsg := schema.Message{
+			Role:      schema.RoleAssistant,
+			Content:   strings.TrimSpace(currentTurnThinkingContent + "\n" + actionResp.Content),
+			ToolCalls: actionResp.ToolCalls,
+		}
 
-		// 【驾驭精髓】：注意，写入 Session（硬盘/全量内存）的永远是全量的真实响应，不受 Compact 影响！
+		// 写入 Session（硬盘/全量内存）的永远是全量的真实响应，不受 Compact 影响！
 		// Compact 只作用于本轮发给大模型的那个临时 Context。
-		session.Append(*actionResp)
+		session.Append(finalAssistantMsg)
 		compactedContext = append(compactedContext, *actionResp)
 
 		if actionResp.Content != "" && reporter != nil {
@@ -101,9 +110,16 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 				}
 
 				result := e.registry.Execute(ctx, call)
-
+				finalOutput := result.Output
+				if result.IsError {
+					// 发生错误，交由 RecoveryManager 诊断并注入 救援指南
+					finalOutput = e.recovery.AnalyzeAndInject(call.Name, result.Output)
+					log.Printf(" -> [Go-%d] ❌ 注入救援指南: %s\n", idx, finalOutput)
+				} else {
+					log.Printf(" -> [Go-%d] ✅ 工具执行成功 (返回 %d 字节)\n", idx, len(result.Output))
+				}
 				if reporter != nil {
-					displayOutput := result.Output
+					displayOutput := finalOutput
 					if len(displayOutput) > 200 {
 						displayOutput = displayOutput[:200] + "... (已截断)"
 					}
@@ -111,7 +127,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 				}
 				observationMsgs[idx] = schema.Message{
 					Role:       schema.RoleUser,
-					Content:    result.Output,
+					Content:    finalOutput,
 					ToolCallID: call.ID,
 				}
 			}(i, toolCall)

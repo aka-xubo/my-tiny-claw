@@ -61,9 +61,9 @@ func (s *Session) GetWorkingMemory(limit int) []schema.Message {
 	copy(res, s.history[total-limit:])
 
 	// 【驾驭防线】：大模型 API 强制要求历史消息的连续性！
-	// 如果我们截断的第一条消息恰好是一个 ToolResult (RoleUser 且含有 ToolCallID)，
-	// 但发出这个请求的 ToolCall 被我们截断抛弃了，大模型 API 会直接报 400 Bad Request。
-	// 因此，如果切片首条属于“孤儿”工具响应，我们必须将其强行舍弃，顺延到下一条正常的 User/Assistant 消息。
+	// 如果截断的第一条消息恰好是一个 ToolResult (RoleUser 且含有 ToolCallID)，
+	// 但发出这个请求的 ToolCall 被截断抛弃了，大模型 API 会直接报 400 Bad Request。
+	// 因此，如果切片首条属于“孤儿”工具响应 必须将其强行舍弃，顺延到下一条正常的 User/Assistant 消息。
 	for len(res) > 0 {
 		if res[0].Role == schema.RoleUser && res[0].ToolCallID != "" {
 			res = res[1:]

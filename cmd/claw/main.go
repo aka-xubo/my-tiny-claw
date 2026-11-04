@@ -33,10 +33,10 @@ func main() {
 	registry.Register(tools.NewBashTool(workDir))
 	registry.Register(tools.NewEditFileTool(workDir))
 
-	sessionID := "task_web_server_01"
+	sessionID := "test_recovery_001"
 	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: *promptPtr})
-	eng := engine.NewAgentEngine(llmProvider, registry, true, false)
+	eng := engine.NewAgentEngine(llmProvider, registry, false, false)
 	reporter := engine.NewTerminalReporter()
 	err := eng.Run(context.Background(), sess, reporter)
 	if err != nil {
