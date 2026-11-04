@@ -20,6 +20,7 @@ type AgentEngine struct {
 	PlanMode       bool // 【新增】暴露给外部的计划模式开关
 	compactor      *cctx.Compactor
 	recovery       *cctx.RecoveryManager
+	injector       *ReminderInjector // 【新增】提醒注入器
 }
 
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, enableThinking bool) *AgentEngine {
@@ -32,6 +33,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, ena
 		// 并保护最近的 6 条消息（大约两轮 Turn 的交互）
 		compactor: cctx.NewCompactor(20000, 6),
 		recovery:  cctx.NewRecoveryManager(),
+		injector:  NewReminderInjector(),
 	}
 }
 
@@ -101,6 +103,11 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
 		var wg sync.WaitGroup
 
+		// 用于收集本轮执行的最后一个工具，供 Reminder 探测器分析
+		// 如果并发调用了多个工具，可以逐个分析或仅分析报错的那个。这里简化为取第一个
+		var lastToolCall schema.ToolCall
+		var lastToolResult schema.ToolResult
+
 		for i, toolCall := range actionResp.ToolCalls {
 			wg.Add(1)
 			go func(idx int, call schema.ToolCall) {
@@ -130,12 +137,25 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 					Content:    finalOutput,
 					ToolCallID: call.ID,
 				}
+				// 捕获状态供外部探测器使用
+				if idx == 0 {
+					lastToolCall = call
+					lastToolResult = result
+				}
 			}(i, toolCall)
 		}
 		wg.Wait()
 
 		// 将全量观测结果持久化到 Session 中
 		session.Append(observationMsgs...)
+
+		//核心防线：在准备进入下一轮之前，进行死循环探测！
+		reminderMsg := e.injector.CheckAndInject(lastToolCall, lastToolResult)
+		if reminderMsg != nil {
+			// 如果触发了干预规则，将这条严厉的提醒作为 User 消息，强制追加到 Session 的最末尾！
+			// 大模型在下一轮被唤醒时，第一眼就会看到这句话，从而打破局部执念。
+			session.Append(*reminderMsg)
+		}
 	}
 
 	return nil
