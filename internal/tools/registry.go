@@ -10,6 +10,10 @@ import (
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 )
 
+// MiddlewareFunc 定义了中间件的签名。
+// 它接收当前的 ToolCall，并返回一个是否允许执行的布尔值 (allowed)，以及拦截时的原因 (rejectReason)。
+type MiddlewareFunc func(ctx context.Context, call schema.ToolCall) (allowed bool, rejectReason string)
+
 // BaseTool 是所有具体工具必须实现的通用接口
 type BaseTool interface {
 	// Name 返回工具的全局唯一名称 (大模型通过这个名字调用它)
@@ -30,6 +34,8 @@ type Registry interface {
 	// Register 挂载一个新的工具到系统中
 	Register(tool BaseTool)
 
+	Use(middleware MiddlewareFunc)
+
 	// GetAvailableTools 返回当前系统挂载的所有工具的 Schema，供 Main Loop 交给 Provider
 	GetAvailableTools() []schema.ToolDefinition
 
@@ -40,12 +46,14 @@ type Registry interface {
 // registryImpl 是 Registry 接口的默认实现
 type registryImpl struct {
 	// 使用 map 以工具的 Name 作为 Key 进行快速 O(1) 路由查找
-	tools map[string]BaseTool
+	tools       map[string]BaseTool
+	middlewares []MiddlewareFunc
 }
 
 func NewRegistry() Registry {
 	return &registryImpl{
-		tools: make(map[string]BaseTool),
+		tools:       make(map[string]BaseTool),
+		middlewares: make([]MiddlewareFunc, 0),
 	}
 }
 
@@ -66,6 +74,10 @@ func (r *registryImpl) GetAvailableTools() []schema.ToolDefinition {
 	return defs
 }
 
+func (r *registryImpl) Use(middleware MiddlewareFunc) {
+	r.middlewares = append(r.middlewares, middleware)
+}
+
 func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
 	// 1. 路由查找：如果在注册表中找不到该工具，这是模型产生了幻觉，直接向模型抛出错误
 	tool, exists := r.tools[call.Name]
@@ -75,6 +87,16 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 			ToolCallID: call.ID,
 			Output:     errMsg,
 			IsError:    true, // 标记为错误，模型看到后会尝试纠正
+		}
+	}
+	//
+	for _, mw := range r.middlewares {
+		allowed, reason := mw(ctx, call)
+		if !allowed {
+			log.Printf("[Registry] ⚠️ 工具 %s 被 Middleware 拦截: %s\n", call.Name, reason)
+			// 必须返回 Error，强制大模型阅读拒绝理由
+			return schema.ToolResult{ToolCallID: call.ID, Output: fmt.Sprintf("执行被系统拦截。原因: %s", reason), IsError: true}
+
 		}
 	}
 
