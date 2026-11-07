@@ -4,73 +4,54 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"os"
 
 	cctx "github.com/aka-xubo/my-tiny-claw/internal/context"
 	"github.com/aka-xubo/my-tiny-claw/internal/engine"
-	"github.com/aka-xubo/my-tiny-claw/internal/feishu"
 	"github.com/aka-xubo/my-tiny-claw/internal/provider"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 	"github.com/aka-xubo/my-tiny-claw/internal/tools"
-	"github.com/larksuite/oapi-sdk-go/v3/core/httpserverext"
 )
 
 func main() {
-
-	// 通过命令行参数接收用户的 prompt
-	/*promptPtr := flag.String("prompt", "", "要交给 Agent 执行的任务描述")
-	flag.Parse()
-	if *promptPtr == "" {
-		fmt.Println("用法: go run cmd/claw/main.go -prompt \"你的任务指令\"")
-		os.Exit(1)
-	}*/
 	llmProvider := provider.NewOpenAIProvider(os.Getenv("CODEX_MODEL"))
 	workDir, _ := os.Getwd()
 	workDir += "/workspace"
-	registry := tools.NewRegistry()
-	registry.Register(tools.NewReadFileTool(workDir))
-	registry.Register(tools.NewWriteFileTool(workDir))
-	registry.Register(tools.NewBashTool(workDir))
-	registry.Register(tools.NewEditFileTool(workDir))
 
-	sessionID := "test_command_intercept_001"
+	// 【防御沙箱】为子智能体准备受限的只读注册表
+	readOnlyRegistry := tools.NewRegistry()
+	readOnlyRegistry.Register(tools.NewReadFileTool(workDir))
+	readOnlyRegistry.Register(tools.NewBashTool(workDir)) // 允许简单的 grep 等搜索操作
+
+	// 为主智能体准备全功能注册表
+	mainRegistry := tools.NewRegistry()
+	mainRegistry.Register(tools.NewReadFileTool(workDir))
+	mainRegistry.Register(tools.NewWriteFileTool(workDir))
+	mainRegistry.Register(tools.NewBashTool(workDir))
+	mainRegistry.Register(tools.NewEditFileTool(workDir))
+
+	// 初始化主引擎
+	eng := engine.NewAgentEngine(llmProvider, mainRegistry, false, false)
+	reporter := engine.NewTerminalReporter()
+
+	// 【核心装配】：将带有 Engine 引用和只读 Registry 的 Subagent 工具注册进主线
+	mainRegistry.Register(tools.NewSubagentTool(eng, readOnlyRegistry, reporter))
+
+	sessionID := "test_subagent_001"
 	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: ""})
-	eng := engine.NewAgentEngine(llmProvider, registry, false, false)
-	bot := feishu.NewFeishuBot(eng, sess)
 
-	handler := httpserverext.NewEventHandlerFunc(bot.GetEventDispatcher())
+	prompt := `
+    我需要你在这个遗留项目里，找到那个“核心密码”。
+    为了防止污染主上下文，请你务必派出子智能体（spawn_subagent）去执行探索任务。
+    你可以让子智能体使用 bash 去查找当前目录（及其所有子目录）下名为 config.txt 的文件。
+    子智能体拿到密码向你汇报后，请你亲自使用 write_file 工具，将密码写在根目录的 answer.txt 里。
+    `
 
-	// 【核心注入】注册安全拦截 Middleware
-	registry.Use(func(ctx context.Context, call schema.ToolCall) (bool, string) {
-		argsStr := string(call.Arguments)
+	log.Println("\n>>> 🚀 启动多智能体协同测试...")
+	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
 
-		// 检查是否命中高危特征库
-		if feishu.IsDangerousCommand(call.Name, argsStr) {
-			taskID := call.ID // 使用大模型生成的唯一 ToolCallID 作为 TaskID
-
-			// 挂起当前协程，发送消息给飞书，死死等待人类的审批！
-			allowed, reason := feishu.GlobalApprovalMgr.WaitForApproval(ctx, taskID, call.Name, argsStr, bot.Reporter())
-
-			if !allowed {
-				return false, reason // 拒绝，将理由传回给大模型
-			}
-			return true, "" // 同意，放行底层工具
-		}
-
-		// 没命中黑名单，直接 YOLO 放行
-		return true, ""
-	})
-
-	// 3. 注册路由并启动 HTTP 服务
-	http.HandleFunc("/webhook/event", handler)
-
-	port := ":48080"
-	log.Printf("🚀 go-tiny-claw 飞书服务端已启动，正在监听 %s 端口\n", port)
-
-	err := http.ListenAndServe(port, nil)
+	err := eng.Run(context.Background(), sess, reporter)
 	if err != nil {
-		log.Fatalf("服务器启动失败: %v", err)
+		log.Fatalf("引擎运行崩溃: %v", err)
 	}
 }
