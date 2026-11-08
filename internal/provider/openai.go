@@ -100,6 +100,12 @@ func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, av
 		Role:    schema.RoleAssistant,
 		Content: resp.OutputText(),
 	}
+	if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+		resultMsg.Usage = &schema.Usage{
+			PromptTokens:     int(resp.Usage.InputTokens),
+			CompletionTokens: int(resp.Usage.OutputTokens),
+		}
+	}
 	for _, output := range resp.Output {
 		if output.Type != "function_call" {
 			continue

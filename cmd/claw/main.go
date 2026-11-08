@@ -8,16 +8,41 @@ import (
 
 	cctx "github.com/aka-xubo/my-tiny-claw/internal/context"
 	"github.com/aka-xubo/my-tiny-claw/internal/engine"
+	"github.com/aka-xubo/my-tiny-claw/internal/observability"
 	"github.com/aka-xubo/my-tiny-claw/internal/provider"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 	"github.com/aka-xubo/my-tiny-claw/internal/tools"
 )
 
 func main() {
-	llmProvider := provider.NewOpenAIProvider(os.Getenv("CODEX_MODEL"))
+	realProvider := provider.NewOpenAIProvider(os.Getenv("CODEX_MODEL"))
 	workDir, _ := os.Getwd()
 	workDir += "/workspace"
+	sessionID := "test_observability_001"
+	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
+	// 2. 核心拼装：用 Tracker 将真实的大脑包裹起来
+	trackedProvider := observability.NewCostTracker(realProvider, "gpt-6.1-sol", sess)
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewBashTool(workDir))
+	// 3. 将被包裹的 Provider 注入给 Engine (Engine 毫不知情)
+	eng := engine.NewAgentEngine(trackedProvider, registry, false, false)
+	reporter := engine.NewTerminalReporter()
+	prompt := `请用 bash 帮我用 date 命令查一下现在的时间。`
+	log.Println("\n>>> 🚀 启动带仪表盘的可观测性测试...")
+	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
+	err := eng.Run(context.Background(), sess, reporter)
+	if err != nil {
+		log.Fatalf("引擎运行崩溃: %v", err)
+	}
+	log.Printf("\n================ 财务报表 ================\n")
+	log.Printf("会话 ID: %s\n", sess.ID)
+	log.Printf("总消耗 Input Tokens: %d\n", sess.TotalPromptTokens)
+	log.Printf("总消耗 Output Tokens: %d\n", sess.TotalCompletionTokens)
+	log.Printf("总计费用 (CNY): ¥%.6f\n", sess.TotalCostCNY)
+	log.Printf("==========================================\n")
+}
 
+func testSubAgent(engine *engine.AgentEngine, reporter engine.Reporter, workDir string) {
 	// 【防御沙箱】为子智能体准备受限的只读注册表
 	readOnlyRegistry := tools.NewRegistry()
 	readOnlyRegistry.Register(tools.NewReadFileTool(workDir))
@@ -30,12 +55,8 @@ func main() {
 	mainRegistry.Register(tools.NewBashTool(workDir))
 	mainRegistry.Register(tools.NewEditFileTool(workDir))
 
-	// 初始化主引擎
-	eng := engine.NewAgentEngine(llmProvider, mainRegistry, false, false)
-	reporter := engine.NewTerminalReporter()
-
 	// 【核心装配】：将带有 Engine 引用和只读 Registry 的 Subagent 工具注册进主线
-	mainRegistry.Register(tools.NewSubagentTool(eng, readOnlyRegistry, reporter))
+	mainRegistry.Register(tools.NewSubagentTool(engine, readOnlyRegistry, reporter))
 
 	sessionID := "test_subagent_001"
 	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
@@ -50,7 +71,7 @@ func main() {
 	log.Println("\n>>> 🚀 启动多智能体协同测试...")
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
 
-	err := eng.Run(context.Background(), sess, reporter)
+	err := engine.Run(context.Background(), sess, reporter)
 	if err != nil {
 		log.Fatalf("引擎运行崩溃: %v", err)
 	}
