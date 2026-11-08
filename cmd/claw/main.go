@@ -15,13 +15,33 @@ import (
 )
 
 func main() {
-	realProvider := provider.NewOpenAIProvider(os.Getenv("CODEX_MODEL"))
+	provider := provider.NewOpenAIProvider(os.Getenv("CODEX_MODEL"))
 	workDir, _ := os.Getwd()
 	workDir += "/workspace"
+	sessionID := "test_trace_001"
+	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewBashTool(workDir))
+	registry.Register(tools.NewWriteFileTool(workDir))
+	eng := engine.NewAgentEngine(provider, registry, false, false)
+	reporter := engine.NewTerminalReporter()
+	prompt := ` 为了加快执行速度，请你在一轮回复中，【同时并行】完成以下两件事：
+	 1. 使用 bash 工具执行 'sleep 2 && echo "系统环境检查完毕"'
+	 2. 使用 write_file 工具，在当前目录下创建一个 'trace_test.md'，内容写上 "测试并发的写入"。
+	  请确保你是分别调用两个不同的工具，不要试图把它们合并成一个命令！ `
+	log.Println("\n>>> 🚀 启动trace测试...")
+	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
+	err := eng.Run(context.Background(), sess, reporter)
+	if err != nil {
+		log.Fatalf("引擎运行崩溃: %v", err)
+	}
+}
+
+func testcost(provider provider.LLMProvider, workDir string) {
 	sessionID := "test_observability_001"
 	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
 	// 2. 核心拼装：用 Tracker 将真实的大脑包裹起来
-	trackedProvider := observability.NewCostTracker(realProvider, "gpt-6.1-sol", sess)
+	trackedProvider := observability.NewCostTracker(provider, "gpt-6.1-sol", sess)
 	registry := tools.NewRegistry()
 	registry.Register(tools.NewBashTool(workDir))
 	// 3. 将被包裹的 Provider 注入给 Engine (Engine 毫不知情)

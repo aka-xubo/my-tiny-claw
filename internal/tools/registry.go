@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/aka-xubo/my-tiny-claw/internal/observability"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 )
 
@@ -79,6 +80,12 @@ func (r *registryImpl) Use(middleware MiddlewareFunc) {
 }
 
 func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
+	// 【埋点】：开启工具执行的 Span
+	ctx, span := observability.StartSpan(ctx, "Tool.Execute")
+	span.AddAttribute("tool_name", call.Name)
+	// 将 JSON 参数存入以备调试
+	span.AddAttribute("arguments", string(call.Arguments))
+	defer span.EndSpan() // 无论成功失败，确保结束
 	// 1. 路由查找：如果在注册表中找不到该工具，这是模型产生了幻觉，直接向模型抛出错误
 	tool, exists := r.tools[call.Name]
 	if !exists {
@@ -93,6 +100,8 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 	for _, mw := range r.middlewares {
 		allowed, reason := mw(ctx, call)
 		if !allowed {
+			span.AddAttribute("intercepted", true)
+			span.AddAttribute("reject_reason", reason)
 			log.Printf("[Registry] ⚠️ 工具 %s 被 Middleware 拦截: %s\n", call.Name, reason)
 			// 必须返回 Error，强制大模型阅读拒绝理由
 			return schema.ToolResult{ToolCallID: call.ID, Output: fmt.Sprintf("执行被系统拦截。原因: %s", reason), IsError: true}
@@ -112,10 +121,18 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 			IsError:    true,
 		}
 	}
-
+	//只截取输出的前 100 字符放入 Trace，防止 Trace 文件过度膨胀
+	span.AddAttribute("output_preview", truncate(output, 100))
 	return schema.ToolResult{
 		ToolCallID: call.ID,
 		Output:     output,
 		IsError:    false,
 	}
+}
+
+func truncate(s string, max int) string {
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
 }

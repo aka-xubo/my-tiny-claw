@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	cctx "github.com/aka-xubo/my-tiny-claw/internal/context"
+	"github.com/aka-xubo/my-tiny-claw/internal/observability"
 	"github.com/aka-xubo/my-tiny-claw/internal/provider"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 	"github.com/aka-xubo/my-tiny-claw/internal/tools"
@@ -40,10 +41,23 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, ena
 func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter Reporter) error {
 	log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
 
+	// 【埋点 1】：开启 Root Span，记录整个任务的生命周期
+	ctx, rootSpan := observability.StartSpan(ctx, "Agent.Run")
+	rootSpan.AddAttribute("SessionID", session.ID)
+	rootSpan.AddAttribute("WorkDir", session.WorkDir)
+	defer func() {
+		rootSpan.EndSpan()
+		_ = observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID)
+		log.Printf("📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下\n")
+	}()
 	composer := cctx.NewPromptComposer(session.WorkDir, e.PlanMode)
 	systemMsg := composer.Build()
-
+	turnCount := 0
 	for {
+		turnCount++
+		// 【埋点 2】：记录单次 Turn 循环
+		turnCtx, turnSpan := observability.StartSpan(ctx, fmt.Sprintf("Turn-%d", turnCount))
+		defer turnSpan.EndSpan() // 利用 defer，哪怕遇到了 break 或 error 也会计算耗时
 		availableTools := e.registry.GetAvailableTools()
 
 		// 1. 从 Session 提取出近期的 Working Memory (例如最近 20 条，给压缩器留下充足的判断空间)
@@ -56,15 +70,20 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 		// 2. 【核心注入点】: 在向 Provider 发起推理前，过一遍内存压缩器！
 		// 无论你带出了多少上下文，如果字符总数超标，早期日志将被掩码化，超大日志将被掐头去尾
 		compactedContext := e.compactor.Compact(contextHistory)
+		// 记录发给模型的实际上下文大小，非常有助于排查幻觉
+		turnSpan.AddAttribute("context_message_count", len(compactedContext))
 
 		// 3. 后续的 Provider.Generate 全面使用被保护过的新鲜上下文 (compactedContext)
 		// ================= Phase 1: Thinking =================
 		var currentTurnThinkingContent string
 		if e.EnableThinking {
 			if reporter != nil {
-				reporter.OnThinking(ctx)
+				reporter.OnThinking(turnCtx)
 			}
-			thinkResp, err := e.provider.Generate(ctx, compactedContext, nil)
+			// 【埋点 3】：记录 Thinking 调用 thinkCtx,
+			thinkCtx, thinkSpan := observability.StartSpan(turnCtx, "LLM.Thinking")
+			thinkResp, err := e.provider.Generate(thinkCtx, compactedContext, nil)
+			thinkSpan.EndSpan() // 结束思考跨度
 			if err != nil {
 				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
@@ -76,7 +95,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 		}
 
 		// ================= Phase 2: Action =================
-		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
+		actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
+		actionResp, err := e.provider.Generate(actCtx, compactedContext, availableTools)
+		actSpan.EndSpan()
 		if err != nil {
 			return fmt.Errorf("Action 阶段失败: %w", err)
 		}
@@ -116,7 +137,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
 				}
 
-				result := e.registry.Execute(ctx, call)
+				result := e.registry.Execute(turnCtx, call)
 				finalOutput := result.Output
 				if result.IsError {
 					// 发生错误，交由 RecoveryManager 诊断并注入 救援指南
