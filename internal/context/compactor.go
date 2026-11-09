@@ -4,6 +4,7 @@ package context
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 )
@@ -53,6 +54,11 @@ func (c *Compactor) Compact(msgs []schema.Message) []schema.Message {
 		newMsg := msg
 
 		isInWorkingMemory := i >= protectStartIndex
+		if msg.Kind == schema.MessageKindSkillBody && !isInWorkingMemory && len(msg.Content) > 200 {
+			newMsg.Content = fmt.Sprintf("...[技能 %q 正文已折叠，模型需要时可再次调用 read_skill。原始长度: %d 字节]...", skillName(msg.Content), len(msg.Content))
+			compacted = append(compacted, newMsg)
+			continue
+		}
 
 		// 【核心驾驭逻辑】: 双重降级防线
 		if msg.Role == schema.RoleUser && msg.ToolCallID != "" {
@@ -87,6 +93,18 @@ func (c *Compactor) Compact(msgs []schema.Message) []schema.Message {
 	log.Printf("[Compactor] ✅ 压缩完成。上下文长度从 %d 降至 %d 字符。\n", currentLength, newLength)
 
 	return compacted
+}
+
+func skillName(content string) string {
+	const prefix = "[SKILL_CONTENT_BEGIN name="
+	if !strings.HasPrefix(content, prefix) {
+		return "未知技能"
+	}
+	end := strings.Index(content[len(prefix):], "]")
+	if end < 0 {
+		return "未知技能"
+	}
+	return content[len(prefix) : len(prefix)+end]
 }
 
 // estimateLength 粗略计算当前上下文的总字符长度

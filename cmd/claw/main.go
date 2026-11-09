@@ -20,9 +20,11 @@ func main() {
 	workDir += "/workspace"
 	sessionID := "test_trace_001"
 	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
+	skillLoader := cctx.NewSkillLoader(workDir)
 	registry := tools.NewRegistry()
 	registry.Register(tools.NewBashTool(workDir))
 	registry.Register(tools.NewWriteFileTool(workDir))
+	registry.Register(tools.NewReadSkillTool(skillLoader))
 	eng := engine.NewAgentEngine(provider, registry, false, false)
 	reporter := engine.NewTerminalReporter()
 	prompt := ` 为了加快执行速度，请你在一轮回复中，【同时并行】完成以下两件事：
@@ -44,6 +46,7 @@ func testcost(provider provider.LLMProvider, workDir string) {
 	trackedProvider := observability.NewCostTracker(provider, "gpt-6.1-sol", sess)
 	registry := tools.NewRegistry()
 	registry.Register(tools.NewBashTool(workDir))
+	registry.Register(tools.NewReadSkillTool(cctx.NewSkillLoader(workDir)))
 	// 3. 将被包裹的 Provider 注入给 Engine (Engine 毫不知情)
 	eng := engine.NewAgentEngine(trackedProvider, registry, false, false)
 	reporter := engine.NewTerminalReporter()
@@ -67,6 +70,7 @@ func testSubAgent(engine *engine.AgentEngine, reporter engine.Reporter, workDir 
 	readOnlyRegistry := tools.NewRegistry()
 	readOnlyRegistry.Register(tools.NewReadFileTool(workDir))
 	readOnlyRegistry.Register(tools.NewBashTool(workDir)) // 允许简单的 grep 等搜索操作
+	readOnlyRegistry.Register(tools.NewReadSkillTool(cctx.NewSkillLoader(workDir)))
 
 	// 为主智能体准备全功能注册表
 	mainRegistry := tools.NewRegistry()
@@ -74,6 +78,7 @@ func testSubAgent(engine *engine.AgentEngine, reporter engine.Reporter, workDir 
 	mainRegistry.Register(tools.NewWriteFileTool(workDir))
 	mainRegistry.Register(tools.NewBashTool(workDir))
 	mainRegistry.Register(tools.NewEditFileTool(workDir))
+	mainRegistry.Register(tools.NewReadSkillTool(cctx.NewSkillLoader(workDir)))
 
 	// 【核心装配】：将带有 Engine 引用和只读 Registry 的 Subagent 工具注册进主线
 	mainRegistry.Register(tools.NewSubagentTool(engine, readOnlyRegistry, reporter))

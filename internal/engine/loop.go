@@ -121,6 +121,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 			break
 		}
 
+		loadSkillTurn := hasReadSkillCall(actionResp.ToolCalls)
 		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
 		var wg sync.WaitGroup
 
@@ -137,7 +138,16 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
 				}
 
-				result := e.registry.Execute(turnCtx, call)
+				var result schema.ToolResult
+				if loadSkillTurn && call.Name != "read_skill" {
+					result = schema.ToolResult{
+						ToolCallID: call.ID,
+						Output:     "本轮正在加载技能正文，其他执行型工具尚未执行。请在下一轮阅读 read_skill 的结果后重新发起该工具调用。",
+						IsError:    true,
+					}
+				} else {
+					result = e.registry.Execute(turnCtx, call)
+				}
 				finalOutput := result.Output
 				if result.IsError {
 					// 发生错误，交由 RecoveryManager 诊断并注入 救援指南
@@ -157,6 +167,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 					Role:       schema.RoleUser,
 					Content:    finalOutput,
 					ToolCallID: call.ID,
+					Kind:       messageKindForTool(call.Name),
 				}
 				// 捕获状态供外部探测器使用
 				if idx == 0 {
@@ -180,6 +191,22 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 	}
 
 	return nil
+}
+
+func hasReadSkillCall(calls []schema.ToolCall) bool {
+	for _, call := range calls {
+		if call.Name == "read_skill" {
+			return true
+		}
+	}
+	return false
+}
+
+func messageKindForTool(toolName string) string {
+	if toolName == "read_skill" {
+		return schema.MessageKindSkillBody
+	}
+	return ""
 }
 
 // internal/engine/loop.go (续加在末尾)
@@ -271,6 +298,7 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 					Role:       schema.RoleUser,
 					Content:    finalOutput,
 					ToolCallID: call.ID,
+					Kind:       messageKindForTool(call.Name),
 				}
 			}(i, toolCall)
 		}

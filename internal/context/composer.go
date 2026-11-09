@@ -76,10 +76,21 @@ func (c *PromptComposer) Build() schema.Message {
 		promptBuilder.WriteString("\n```\n")
 	}
 
-	// 4. 动态加载技能外挂 (Skills)
-	skillsContent := c.skillLoader.LoadAll()
-	if skillsContent != "" {
-		promptBuilder.WriteString(skillsContent)
+	// 4. 只注入技能元数据，正文由 read_skill 工具按需加载。
+	descriptors := c.skillLoader.ListDescriptors()
+	if len(descriptors) > 0 {
+		promptBuilder.WriteString(`
+### 可用专业技能目录（渐进式加载）
+以下技能只展示名称和触发描述。判断当前任务需要某个技能后，必须先调用 read_skill 获取完整正文；未加载正文前，不得猜测技能的执行步骤。调用 read_skill 时，本轮不要同时调用其他执行型工具。
+
+`)
+		for _, descriptor := range descriptors {
+			promptBuilder.WriteString("- ")
+			promptBuilder.WriteString(descriptor.Name)
+			promptBuilder.WriteString(": ")
+			promptBuilder.WriteString(descriptor.Description)
+			promptBuilder.WriteString("\n")
+		}
 	}
 
 	return schema.Message{
