@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 
 	"github.com/aka-xubo/my-tiny-claw/internal/observability"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
@@ -26,6 +27,11 @@ type BaseTool interface {
 	// Execute 接收大模型吐出的 JSON 参数，执行具体业务逻辑
 	// 注意：参数是 json.RawMessage，反序列化由各个具体工具内部自行处理
 	Execute(ctx context.Context, args json.RawMessage) (string, error)
+}
+
+// TraceRedactor 由不希望参数和输出进入 Trace 的工具实现 (例如外部 MCP 工具)
+type TraceRedactor interface {
+	RedactTrace() bool
 }
 
 // internal/tools/registry.go (续)
@@ -72,6 +78,8 @@ func (r *registryImpl) GetAvailableTools() []schema.ToolDefinition {
 	for _, tool := range r.tools {
 		defs = append(defs, tool.Definition())
 	}
+	// 按名称排序，保证每轮发给模型的工具顺序稳定 (有利于 Prompt 缓存命中)
+	sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
 	return defs
 }
 
@@ -83,11 +91,19 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 	// 【埋点】：开启工具执行的 Span
 	ctx, span := observability.StartSpan(ctx, "Tool.Execute")
 	span.AddAttribute("tool_name", call.Name)
-	// 将 JSON 参数存入以备调试
-	span.AddAttribute("arguments", string(call.Arguments))
 	defer span.EndSpan() // 无论成功失败，确保结束
 	// 1. 路由查找：如果在注册表中找不到该工具，这是模型产生了幻觉，直接向模型抛出错误
 	tool, exists := r.tools[call.Name]
+	redact := false
+	if rt, ok := tool.(TraceRedactor); ok && rt.RedactTrace() {
+		redact = true
+	}
+	// 将 JSON 参数存入以备调试 (敏感工具只记录字节数)
+	if redact {
+		span.AddAttribute("arguments_bytes", len(call.Arguments))
+	} else {
+		span.AddAttribute("arguments", string(call.Arguments))
+	}
 	if !exists {
 		errMsg := fmt.Sprintf("Error: 系统中不存在名为 '%s' 的工具。", call.Name)
 		return schema.ToolResult{
@@ -122,7 +138,9 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 		}
 	}
 	//只截取输出的前 100 字符放入 Trace，防止 Trace 文件过度膨胀
-	span.AddAttribute("output_preview", truncate(output, 100))
+	if !redact {
+		span.AddAttribute("output_preview", truncate(output, 100))
+	}
 	return schema.ToolResult{
 		ToolCallID: call.ID,
 		Output:     output,

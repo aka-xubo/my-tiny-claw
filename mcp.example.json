@@ -1,0 +1,21 @@
+{
+  "servers": {
+    "github": {
+      "transport": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_GITHUB_TOKEN}"
+      },
+      "tools": ["create_issue", "list_issues"]
+    },
+    "search": {
+      "transport": "stateless-http",
+      "url": "https://search.example.com/mcp"
+    },
+    "notion": {
+      "transport": "streamable-http",
+      "url": "https://mcp.notion.example.com/mcp",
+      "oauth": {}
+    }
+  }
+}
