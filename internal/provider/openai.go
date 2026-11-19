@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -21,6 +22,8 @@ type OpenAIProvider struct {
 }
 
 const defaultBaseURL = "https://coding.gaiaworks.net/openai/v1"
+
+var _ StreamingProvider = (*OpenAIProvider)(nil)
 
 func NewOpenAIProvider(model string) *OpenAIProvider {
 	key := strings.TrimSpace(os.Getenv("CODEX_API_KEY"))
@@ -70,6 +73,71 @@ func newOpenAIProvider(model, key string, httpClient option.HTTPClient) *OpenAIP
 }
 
 func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition) (*schema.Message, error) {
+	resp, err := p.client.Responses.New(ctx, p.buildParams(msgs, availableTools))
+	if err != nil {
+		return nil, wrapAPIError(err)
+	}
+	return messageFromResponse(resp), nil
+}
+
+// GenerateStream 使用 Responses API 的 SSE 流式接口。文本增量实时交给 onDelta，
+// ToolCalls 和 Usage 统一从 response.completed 事件携带的完整 Response 中解析，
+// 保证与 Generate 的结果一致。
+//
+// 如果流在收到任何事件之前就失败（例如中转站不支持 SSE、连接被拒绝），
+// 自动退回一次非流式 Generate；一旦已经收到事件，就不再重试，直接返回错误。
+func (p *OpenAIProvider) GenerateStream(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition, onDelta StreamHandler) (*schema.Message, error) {
+	msg, receivedEvents, err := p.generateStream(ctx, msgs, availableTools, onDelta)
+	if err == nil || receivedEvents || ctx.Err() != nil {
+		return msg, err
+	}
+	log.Printf("[Provider] ⚠️ 流式请求未收到任何事件 (%v)，退回非流式请求\n", err)
+	msg, err = p.Generate(ctx, msgs, availableTools)
+	if err != nil {
+		return nil, err
+	}
+	// 非流式结果一次性交给 onDelta，调用方的展示逻辑保持一致。
+	if onDelta != nil && msg.Content != "" {
+		onDelta(msg.Content)
+	}
+	return msg, nil
+}
+
+func (p *OpenAIProvider) generateStream(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition, onDelta StreamHandler) (msg *schema.Message, receivedEvents bool, err error) {
+	stream := p.client.Responses.NewStreaming(ctx, p.buildParams(msgs, availableTools))
+	defer stream.Close()
+
+	for stream.Next() {
+		receivedEvents = true
+		event := stream.Current()
+		switch event.Type {
+		case "response.output_text.delta":
+			if onDelta != nil && event.Delta != "" {
+				onDelta(event.Delta)
+			}
+		case "response.completed":
+			completed := event.AsResponseCompleted()
+			return messageFromResponse(&completed.Response), true, nil
+		case "response.failed":
+			failed := event.AsResponseFailed()
+			return nil, true, fmt.Errorf("OpenAI Responses API 流式响应失败: %s (code=%s)",
+				failed.Response.Error.Message, failed.Response.Error.Code)
+		case "response.incomplete":
+			incomplete := event.AsResponseIncomplete()
+			return nil, true, fmt.Errorf("OpenAI Responses API 流式响应未完成: %s",
+				incomplete.Response.IncompleteDetails.Reason)
+		case "error":
+			errEvent := event.AsError()
+			return nil, true, fmt.Errorf("OpenAI Responses API 流式错误: %s (code=%s)", errEvent.Message, errEvent.Code)
+		}
+	}
+	if err := stream.Err(); err != nil {
+		return nil, receivedEvents, wrapAPIError(err)
+	}
+	return nil, receivedEvents, errors.New("OpenAI Responses API 流式响应在 response.completed 之前结束")
+}
+
+func (p *OpenAIProvider) buildParams(msgs []schema.Message, availableTools []schema.ToolDefinition) responses.ResponseNewParams {
 	params := responses.ResponseNewParams{
 		Model: sharedResponsesModel(p.model),
 		Input: responses.ResponseNewParamsInputUnion{
@@ -79,23 +147,25 @@ func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, av
 	if tools := responseTools(availableTools); len(tools) > 0 {
 		params.Tools = tools
 	}
+	return params
+}
 
-	resp, err := p.client.Responses.New(ctx, params)
-	if err != nil {
-		var apiErr *openai.Error
-		if errors.As(err, &apiErr) {
-			detail := strings.TrimSpace(apiErr.Message)
-			if detail == "" {
-				detail = strings.TrimSpace(apiErr.RawJSON())
-			}
-			return nil, fmt.Errorf(
-				"OpenAI Responses API 请求失败 (%d): %s (type=%s code=%s param=%s): %w",
-				apiErr.StatusCode, detail, apiErr.Type, apiErr.Code, apiErr.Param, err,
-			)
+func wrapAPIError(err error) error {
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		detail := strings.TrimSpace(apiErr.Message)
+		if detail == "" {
+			detail = strings.TrimSpace(apiErr.RawJSON())
 		}
-		return nil, fmt.Errorf("OpenAI Responses API 请求失败: %w", err)
+		return fmt.Errorf(
+			"OpenAI Responses API 请求失败 (%d): %s (type=%s code=%s param=%s): %w",
+			apiErr.StatusCode, detail, apiErr.Type, apiErr.Code, apiErr.Param, err,
+		)
 	}
+	return fmt.Errorf("OpenAI Responses API 请求失败: %w", err)
+}
 
+func messageFromResponse(resp *responses.Response) *schema.Message {
 	resultMsg := &schema.Message{
 		Role:    schema.RoleAssistant,
 		Content: resp.OutputText(),
@@ -118,8 +188,7 @@ func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, av
 			Arguments: []byte(call.Arguments),
 		})
 	}
-
-	return resultMsg, nil
+	return resultMsg
 }
 
 // sharedResponsesModel is kept as a small conversion point because the SDK

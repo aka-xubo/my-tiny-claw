@@ -32,6 +32,8 @@ func runCLI() error {
 	promptPtr := flag.String("prompt", "", "要交给 Agent 执行的任务描述")
 	workDirPtr := flag.String("dir", ".", "Agent 运行的工作区目录路径 (默认为当前目录)")
 	sessionPtr := flag.String("session", "cli_default_session", "指定会话 ID，支持断点续传")
+	thinkingPtr := flag.Bool("thinking", false, "开启慢思考 (Thinking) 阶段，流式模式下会实时展示思考内容")
+	streamPtr := flag.Bool("stream", true, "实时流式输出模型回复（-stream=false 关闭）")
 	flag.Parse()
 	if *promptPtr == "" {
 		return fmt.Errorf("用法: go-tiny-claw -prompt \"你的任务描述\" [-dir /path/to/workdir] [-session session_id]")
@@ -90,8 +92,9 @@ func runCLI() error {
 	// 在 CLI 模式下，默认开启 YOLO 模式（全权信任本地执行），
 	// 因此这里暂时不挂载 Feishu 审批 Middleware。
 	// 4. 初始化核心引擎 (组装器内部会自动加载 Composer, Compactor, Recovery, Reminders)
-	// 开启 EnableThinking = true
-	eng := engine.NewAgentEngine(trackedProvider, registry, true, false)
+	// PlanMode 默认开启；Thinking 由 -thinking 控制
+	eng := engine.NewAgentEngine(trackedProvider, registry, true, *thinkingPtr)
+	eng.Stream = *streamPtr
 	// 【追踪装配】：初始化链路追踪 Root Span
 	ctx, rootSpan := observability.StartSpan(runCtx, "CLI.TaskRun")
 	rootSpan.AddAttribute("Prompt", *promptPtr)
