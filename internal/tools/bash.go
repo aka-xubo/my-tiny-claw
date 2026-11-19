@@ -4,6 +4,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"time"
@@ -12,11 +13,19 @@ import (
 )
 
 type BashTool struct {
-	workDir string // 工作区约束
+	workDir  string
+	manager  *TaskManager
+	readOnly bool
 }
 
+// NewBashTool keeps the original one-shot behavior for embedded callers and
+// read-only subagents. The main agent should use NewManagedBashTool.
 func NewBashTool(workDir string) *BashTool {
 	return &BashTool{workDir: workDir}
+}
+
+func NewManagedBashTool(workDir string, manager *TaskManager) *BashTool {
+	return &BashTool{workDir: workDir, manager: manager}
 }
 
 func (t *BashTool) Name() string {
@@ -26,37 +35,160 @@ func (t *BashTool) Name() string {
 func (t *BashTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
 		Name:        t.Name(),
-		Description: "在当前工作区执行任意的 bash 命令。支持链式命令(如 &&)。返回标准输出(stdout)和标准错误(stderr)。",
+		Description: "在当前工作区执行 bash 命令。短命令直接返回；需要持续运行的命令会返回 session_id，可使用 poll、list、stop 查看或管理后台会话。",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"command": map[string]interface{}{
 					"type":        "string",
-					"description": "要执行的 bash 命令，例如: ls -la 或 go test ./...",
+					"description": "首次调用时执行的 bash 命令，例如 ls -la 或 npm run dev",
 				},
+				"action": map[string]interface{}{
+					"type": "string", "enum": []string{"poll", "list", "stop"},
+					"description": "管理已有会话：poll 读取输出，list 列出会话，stop 终止会话",
+				},
+				"session_id":       map[string]interface{}{"type": "string", "description": "由 bash 返回的会话 ID"},
+				"yield_time_ms":    map[string]interface{}{"type": "integer", "description": "本次调用最多等待的毫秒数；默认 10000，最大 30000"},
+				"cursor":           map[string]interface{}{"type": "integer", "description": "可选的日志读取游标"},
+				"max_output_bytes": map[string]interface{}{"type": "integer", "description": "本次最多返回的日志字节数，最大 8000"},
 			},
-			"required": []string{"command"},
 		},
 	}
 }
 
 type bashArgs struct {
-	Command string `json:"command"`
+	Command        string `json:"command"`
+	Action         string `json:"action"`
+	SessionID      string `json:"session_id"`
+	YieldTimeMS    *int   `json:"yield_time_ms"`
+	Cursor         *int64 `json:"cursor"`
+	MaxOutputBytes int    `json:"max_output_bytes"`
+}
+
+type bashResponse struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
 }
 
 func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var input bashArgs
 	if err := json.Unmarshal(args, &input); err != nil {
+		if t.manager != nil {
+			return managedError(1, fmt.Sprintf("参数解析失败: %v", err)), nil
+		}
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
+	if t.manager == nil {
+		if input.Action != "" || input.SessionID != "" {
+			return "", fmt.Errorf("当前 bash 工具不支持会话管理")
+		}
+		if input.Command == "" {
+			return "", fmt.Errorf("command 不能为空")
+		}
+		return t.executeSync(ctx, input.Command)
+	}
+	output, err := t.executeManaged(ctx, input)
+	if err != nil {
+		return managedError(1, err.Error()), nil
+	}
+	return output, nil
+}
 
-	// 【驾驭底线 1】：Time Budgeting (时间预算与超时控制)
-	// 给予 bash 命令一个最大执行时间，防止大模型卡死进程 (比如运行了 top 或持续监听的 Web 服务)
+func (t *BashTool) executeManaged(ctx context.Context, input bashArgs) (string, error) {
+	if input.Command != "" && input.SessionID != "" {
+		return "", fmt.Errorf("command 与 session_id 不能同时提供")
+	}
+	if input.Action != "" && input.Command != "" {
+		return "", fmt.Errorf("action 调用不能同时提供 command")
+	}
+	if input.Action == "" && input.Command == "" {
+		return "", fmt.Errorf("首次调用必须提供 command，后续调用必须提供 action")
+	}
+	if input.Action != "" && input.Action != "poll" && input.Action != "list" && input.Action != "stop" {
+		return "", fmt.Errorf("不支持的 action: %s", input.Action)
+	}
+	maxOutput := input.MaxOutputBytes
+	if maxOutput == 0 {
+		maxOutput = 8000
+	}
+	if maxOutput < 1 || maxOutput > 8000 {
+		return "", fmt.Errorf("max_output_bytes 必须在 1 到 8000 之间")
+	}
+	wait, err := parseYieldTime(input.YieldTimeMS, input.Action == "poll")
+	if err != nil {
+		return "", err
+	}
+	ownerID := executionOwner(ctx)
+	workDir := executionWorkDir(ctx, t.workDir)
+
+	switch input.Action {
+	case "list":
+		if input.SessionID != "" {
+			return "", fmt.Errorf("list 不需要 session_id")
+		}
+		items, err := t.manager.List(ownerID, workDir)
+		if err != nil {
+			return managedError(1, err.Error()), nil
+		}
+		return encodeBashResponse(bashResponse{Code: 0, Message: "会话列表", Data: items})
+	case "stop":
+		if input.SessionID == "" {
+			return "", fmt.Errorf("stop 必须提供 session_id")
+		}
+		if err := t.manager.Stop(ctx, input.SessionID, ownerID, workDir); err != nil {
+			return managedError(1, err.Error()), nil
+		}
+		snapshot, _ := t.manager.WaitUntil(context.Background(), ownerID, workDir, input.SessionID, 0, maxOutput)
+		return encodeBashResponse(bashResponse{Code: 0, Message: "会话已停止", Data: snapshot})
+	case "poll":
+		if input.SessionID == "" {
+			return "", fmt.Errorf("poll 必须提供 session_id")
+		}
+		snapshot, err := t.manager.Poll(ctx, ownerID, workDir, input.SessionID, wait, input.Cursor, maxOutput)
+		if err != nil {
+			return managedError(1, err.Error()), nil
+		}
+		return encodeBashResponse(bashResponse{Code: 0, Message: "会话输出", Data: snapshot})
+	default:
+		if input.Command == "" {
+			return "", fmt.Errorf("command 不能为空")
+		}
+		sessionID, err := t.manager.Start(ctx, ownerID, workDir, input.Command)
+		if err != nil {
+			code := 1
+			if errors.Is(err, ErrTaskStart) {
+				code = 2
+			}
+			if err == ErrTaskLimit {
+				code = 3
+			}
+			return managedError(code, err.Error()), nil
+		}
+		snapshot, err := t.manager.WaitUntil(ctx, ownerID, workDir, sessionID, wait, maxOutput)
+		if err != nil {
+			return managedError(1, err.Error()), nil
+		}
+		message := "命令执行完成"
+		if snapshot.Status == TaskRunning {
+			message = "命令仍在运行，已返回会话"
+		}
+		return encodeBashResponse(bashResponse{Code: 0, Message: message, Data: snapshot})
+	}
+}
+
+func (t *BashTool) executeSync(ctx context.Context, command string) (string, error) {
+	if t.readOnly {
+		if ok, reason := validateReadOnlyCommand(command); !ok {
+			return "", fmt.Errorf("执行被只读 bash 拦截: %s", reason)
+		}
+	}
+
 	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	// 在 macOS/Linux 下，我们通过将指令包裹在 `bash -c` 中执行，以支持环境变量、管道和逻辑与(&&)等复杂 Shell 语法。
-	cmd := exec.CommandContext(timeoutCtx, "bash", "-c", input.Command)
+	cmd := exec.CommandContext(timeoutCtx, "bash", "-c", command)
 
 	// 【驾驭底线 2】：绑定执行的工作区目录
 	// 确保命令默认在用户指定的 WorkDir 下执行，而不是引擎启动时的绝对路径。
@@ -68,7 +200,7 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	// 如果命令执行超时，返回警告信息让模型知晓
 	if timeoutCtx.Err() == context.DeadlineExceeded {
-		return outputStr + "\n[警告: 命令执行超时(30s)，已被系统强制终止。如果是启动常驻服务，请尝试将其转入后台。]", nil
+		return outputStr + "\n[警告: 命令执行超时(30s)，已被系统强制终止。]", nil
 	}
 
 	// 【驾驭底线 3】：错误原样回传 (Self-Correction 自愈机制)
@@ -90,4 +222,30 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	return outputStr, nil
+}
+
+func parseYieldTime(value *int, poll bool) (time.Duration, error) {
+	if value == nil {
+		return 10 * time.Second, nil
+	}
+	if *value == 0 && poll {
+		return 0, nil
+	}
+	if *value < 250 || *value > 30000 {
+		return 0, fmt.Errorf("yield_time_ms 必须在 250 到 30000 之间，poll 可使用 0")
+	}
+	return time.Duration(*value) * time.Millisecond, nil
+}
+
+func encodeBashResponse(response bashResponse) (string, error) {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return "", fmt.Errorf("编码 bash 响应失败: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func managedError(code int, message string) string {
+	encoded, _ := encodeBashResponse(bashResponse{Code: code, Message: message})
+	return encoded
 }

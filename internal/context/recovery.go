@@ -41,8 +41,8 @@ func (rm *RecoveryManager) AnalyzeAndInject(toolName string, rawError string) st
 		if strings.Contains(lowerError, "command not found") {
 			hint = "系统中未安装该命令。请先思考：是否有替代命令？或者你需要先编写脚本进行安装？"
 		} else if strings.Contains(rawError, "超时") || strings.Contains(rawError, "DeadlineExceeded") {
-			// 匹配 30s context.WithTimeout 报错
-			hint = "该命令执行被超时强杀。如果它是一个常驻服务（如 server 或 watch），请将其转入后台执行（例如使用 `nohup ... &`），不要阻塞主线程。"
+			// 兼容旧版同步 bash 的超时提示；新版 managed bash 会返回 session_id。
+			hint = "该命令等待窗口已结束。如果它是一个常驻服务，请使用 bash 返回的 session_id 调用 action=poll 查看日志，或调用 action=stop 清理进程。"
 		} else if strings.Contains(lowerError, "syntax error") {
 			hint = "Bash 语法错误。请检查引号转义或特殊字符，确保命令在终端中可直接运行。"
 		}

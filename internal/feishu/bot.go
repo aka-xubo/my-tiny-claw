@@ -23,6 +23,7 @@ type FeishuBot struct {
 	appSecret string
 	engine    *engine.AgentEngine
 	sess      *cctx.Session
+	workDir   string
 	r         *FeishuReporter
 }
 
@@ -42,6 +43,7 @@ func NewFeishuBot(eng *engine.AgentEngine, sess *cctx.Session) *FeishuBot {
 		appSecret: appSecret,
 		engine:    eng,
 		sess:      sess,
+		workDir:   sess.WorkDir,
 	}
 }
 
@@ -99,8 +101,11 @@ func (b *FeishuBot) handleAgentRun(chatId string, prompt string) {
 		chatId: chatId,
 	}
 	b.r = reporter
-	b.sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
-	err := b.engine.Run(context.Background(), b.sess, reporter)
+	// 每个飞书 chat 使用独立 Session，使 managed bash 的 owner 和历史互不串线。
+	sessionID := "feishu:" + chatId
+	sess := cctx.GlobalSessionMgr.GetOrCreate(sessionID, b.workDir)
+	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
+	err := b.engine.Run(context.Background(), sess, reporter)
 	if err != nil {
 		reporter.sendMsg(fmt.Sprintf("❌ Agent 运行崩溃: %v", err))
 	}

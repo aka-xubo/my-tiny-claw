@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	cctx "github.com/aka-xubo/my-tiny-claw/internal/context"
@@ -20,23 +22,36 @@ import (
 )
 
 func main() {
+	if err := runCLI(); err != nil {
+		log.Printf("💥 %v", err)
+		os.Exit(1)
+	}
+}
+
+func runCLI() error {
 	promptPtr := flag.String("prompt", "", "要交给 Agent 执行的任务描述")
 	workDirPtr := flag.String("dir", ".", "Agent 运行的工作区目录路径 (默认为当前目录)")
 	sessionPtr := flag.String("session", "cli_default_session", "指定会话 ID，支持断点续传")
 	flag.Parse()
 	if *promptPtr == "" {
-		fmt.Println("用法: go-tiny-claw -prompt \"你的任务描述\" [-dir /path/to/workdir] [-session session_id]")
-		os.Exit(1)
+		return fmt.Errorf("用法: go-tiny-claw -prompt \"你的任务描述\" [-dir /path/to/workdir] [-session session_id]")
 	}
 	// 解析工作区绝对路径
 	workDir, err := filepath.Abs(*workDirPtr)
 	if err != nil {
-		log.Fatalf("解析工作区路径失败: %v", err)
+		return fmt.Errorf("解析工作区路径失败: %w", err)
 	}
 	fmt.Println("==================================================")
 	fmt.Printf("🚀 启动 go-tiny-claw CLI 引擎...\n")
 	fmt.Printf("📁 锁定工作区: %s\n", workDir)
 	fmt.Println("==================================================")
+
+	// 主进程收到 SIGINT/SIGTERM 时取消 Engine，并由 TaskManager 统一清理
+	// 仍在运行的后台会话。
+	runCtx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignal()
+	taskManager := tools.NewTaskManager()
+	defer taskManager.Shutdown()
 
 	// 2. 初始化核心基础服务
 	var realProvider provider.LLMProvider
@@ -51,24 +66,24 @@ func main() {
 	registry := tools.NewRegistry()
 	registry.Register(tools.NewReadFileTool(workDir))
 	registry.Register(tools.NewWriteFileTool(workDir))
-	registry.Register(tools.NewBashTool(workDir))
+	registry.Register(tools.NewManagedBashTool(workDir, taskManager))
 	registry.Register(tools.NewEditFileTool(workDir))
 	registry.Register(tools.NewReadSkillTool(skillLoader))
 
 	// MCP 配置只从用户目录加载；配置不存在时保持现有内置工具行为。
 	mcpConfigPath, err := mcpclient.DefaultConfigPath()
 	if err != nil {
-		log.Fatalf("解析 MCP 配置路径失败: %v", err)
+		return fmt.Errorf("解析 MCP 配置路径失败: %w", err)
 	}
 	mcpConfig, err := mcpclient.LoadConfig(mcpConfigPath)
 	if err != nil {
-		log.Fatalf("加载 MCP 配置失败: %v", err)
+		return fmt.Errorf("加载 MCP 配置失败: %w", err)
 	}
 	mcpManager, err := mcpclient.NewManager(mcpConfig, mcpclient.Options{})
 	if err != nil {
-		log.Fatalf("初始化 MCP Manager 失败: %v", err)
+		return fmt.Errorf("初始化 MCP Manager 失败: %w", err)
 	}
-	mcpManager.Connect(context.Background())
+	mcpManager.Connect(runCtx)
 	for _, tool := range mcpManager.Tools() {
 		registry.Register(tool)
 	}
@@ -78,7 +93,7 @@ func main() {
 	// 开启 EnableThinking = true
 	eng := engine.NewAgentEngine(trackedProvider, registry, true, false)
 	// 【追踪装配】：初始化链路追踪 Root Span
-	ctx, rootSpan := observability.StartSpan(context.Background(), "CLI.TaskRun")
+	ctx, rootSpan := observability.StartSpan(runCtx, "CLI.TaskRun")
 	rootSpan.AddAttribute("Prompt", *promptPtr)
 	// 5. 初始化彩色终端输出器
 	reporter := engine.NewTerminalReporter()
@@ -87,6 +102,8 @@ func main() {
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: *promptPtr})
 	// 6. 启动 Main Loop！
 	err = eng.Run(ctx, sess, reporter)
+	// 先停止后台会话，再关闭 MCP 和导出本次 Trace。
+	taskManager.Shutdown()
 	closeErr := mcpManager.Close()
 	rootSpan.EndSpan()
 	_ = observability.ExportTraceToFile(rootSpan, workDir, sess.ID)
@@ -94,13 +111,13 @@ func main() {
 		log.Printf("关闭 MCP Session 失败: %v", closeErr)
 	}
 	if err != nil {
-		log.Printf("\n💥 引擎运行崩溃: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("引擎运行崩溃: %w", err)
 	}
 	fmt.Println("\n==================================================")
 	fmt.Printf("✨ 任务圆满结束。总耗时: %v\n", time.Since(rootSpan.StartTime))
 	fmt.Printf("💰 Session 累计消耗: $%.6f | Token: Input %d, Output %d\n", sess.TotalCostCNY, sess.TotalPromptTokens, sess.TotalCompletionTokens)
 	fmt.Println("==================================================")
+	return nil
 }
 
 func testcost(provider provider.LLMProvider, workDir string) {
@@ -133,7 +150,8 @@ func testSubAgent(engine *engine.AgentEngine, reporter engine.Reporter, workDir 
 	// 【防御沙箱】为子智能体准备受限的只读注册表
 	readOnlyRegistry := tools.NewRegistry()
 	readOnlyRegistry.Register(tools.NewReadFileTool(workDir))
-	readOnlyRegistry.Register(tools.NewBashTool(workDir)) // 允许简单的 grep 等搜索操作
+	readOnlyRegistry.Register(tools.NewReadOnlyBashTool(workDir)) // 允许简单的 grep 等搜索操作
+	readOnlyRegistry.Use(tools.NewReadOnlyBashMiddleware())
 	readOnlyRegistry.Register(tools.NewReadSkillTool(cctx.NewSkillLoader(workDir)))
 
 	// 为主智能体准备全功能注册表

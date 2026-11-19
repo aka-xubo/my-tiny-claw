@@ -40,6 +40,8 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, ena
 
 func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter Reporter) error {
 	log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
+	// 将当前 Session 作为工具调用的 owner，供 managed bash 做会话隔离。
+	ctx = tools.WithExecutionContext(ctx, session.ID, session.WorkDir)
 
 	// 【埋点 1】：开启 Root Span，记录整个任务的生命周期
 	ctx, rootSpan := observability.StartSpan(ctx, "Agent.Run")
