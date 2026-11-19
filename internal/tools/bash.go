@@ -179,9 +179,7 @@ func (t *BashTool) executeManaged(ctx context.Context, input bashArgs) (string, 
 
 func (t *BashTool) executeSync(ctx context.Context, command string) (string, error) {
 	if t.readOnly {
-		if ok, reason := validateReadOnlyCommand(command); !ok {
-			return "", fmt.Errorf("执行被只读 bash 拦截: %s", reason)
-		}
+		return t.executeReadOnly(ctx, command)
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

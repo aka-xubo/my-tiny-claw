@@ -44,22 +44,21 @@ type TaskSnapshot struct {
 }
 
 type taskSession struct {
-	mu            sync.Mutex
-	sessionID     string
-	ownerID       string
-	workDir       string
-	command       string
-	cmd           *exec.Cmd
-	status        TaskStatus
-	exitCode      *int
-	signal        string
-	startedAt     time.Time
-	finishedAt    *time.Time
-	log           *taskLog
-	done          chan struct{}
-	outputNotify  chan struct{}
-	serverCursor  int64
-	stopRequested bool
+	mu           sync.Mutex
+	sessionID    string
+	ownerID      string
+	workDir      string
+	command      string
+	cmd          *exec.Cmd
+	status       TaskStatus
+	exitCode     *int
+	signal       string
+	startedAt    time.Time
+	finishedAt   *time.Time
+	log          *taskLog
+	done         chan struct{}
+	outputNotify chan struct{}
+	serverCursor int64
 }
 
 type taskOutputWriter struct {
@@ -77,12 +76,15 @@ func (w taskOutputWriter) Write(p []byte) (int, error) {
 }
 
 type TaskManager struct {
-	mu         sync.Mutex
-	sessions   map[string]*taskSession
-	maxActive  int
-	maxRecords int
-	shutdown   bool
-	logLimit   int
+	mu           sync.Mutex
+	sessions     map[string]*taskSession
+	maxActive    int
+	maxRecords   int
+	shutdown     bool
+	logLimit     int
+	pending      int
+	starts       sync.WaitGroup
+	shutdownOnce sync.Once
 }
 
 func NewTaskManager() *TaskManager {
@@ -98,6 +100,9 @@ func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command strin
 	if command == "" {
 		return "", errors.New("命令不能为空")
 	}
+	if ctx != nil && ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	ownerID = normalizeOwner(ownerID)
 	workDir, err := normalizeWorkDir(workDir)
 	if err != nil {
@@ -109,10 +114,10 @@ func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command strin
 		m.mu.Unlock()
 		return "", errors.New("TaskManager 已关闭")
 	}
-	active := 0
+	active := m.pending
 	for _, session := range m.sessions {
 		session.mu.Lock()
-		if session.status == TaskRunning {
+		if session.finishedAt == nil {
 			active++
 		}
 		session.mu.Unlock()
@@ -122,25 +127,34 @@ func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command strin
 		return "", ErrTaskLimit
 	}
 
+	m.pending++
+	m.starts.Add(1)
+	logLimit := m.logLimit
+	m.mu.Unlock()
+	defer m.starts.Done()
+	defer func() {
+		m.mu.Lock()
+		m.pending--
+		m.mu.Unlock()
+	}()
+
+	// Generate the ID before starting so failure cannot leak a child process.
+	id, err := newSessionID()
+	if err != nil {
+		return "", fmt.Errorf("生成会话 ID 失败: %w", err)
+	}
 	cmd := exec.Command("bash", "-c", command)
 	cmd.Dir = workDir
 	cmd.WaitDelay = 2 * time.Second
 	configureProcess(cmd)
-	logBuffer := newTaskLog(m.logLimit)
+	logBuffer := newTaskLog(logLimit)
 	outputNotify := make(chan struct{}, 1)
 	cmd.Stdout = taskOutputWriter{log: logBuffer, notify: outputNotify}
 	cmd.Stderr = taskOutputWriter{log: logBuffer, notify: outputNotify}
 	if err := cmd.Start(); err != nil {
-		m.mu.Unlock()
 		return "", fmt.Errorf("%w: %v", ErrTaskStart, err)
 	}
 
-	id, err := newSessionID()
-	if err != nil {
-		terminateProcess(cmd, nil)
-		m.mu.Unlock()
-		return "", fmt.Errorf("生成会话 ID 失败: %w", err)
-	}
 	session := &taskSession{
 		sessionID:    id,
 		ownerID:      ownerID,
@@ -153,18 +167,25 @@ func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command strin
 		done:         make(chan struct{}),
 		outputNotify: outputNotify,
 	}
-	m.pruneFinishedLocked()
+	m.mu.Lock()
+	evicted := m.pruneFinishedLocked()
 	m.sessions[id] = session
 	m.mu.Unlock()
 
 	go m.wait(session)
-	go m.watchContext(ctx, session)
+	if evicted != nil {
+		stopSessions([]*taskSession{evicted})
+	}
+	if ctx != nil && ctx.Err() != nil {
+		_ = m.Stop(context.Background(), id, ownerID, workDir)
+		return "", ctx.Err()
+	}
 	return id, nil
 }
 
-func (m *TaskManager) pruneFinishedLocked() {
+func (m *TaskManager) pruneFinishedLocked() *taskSession {
 	if len(m.sessions) < m.maxRecords {
-		return
+		return nil
 	}
 	var oldestID string
 	var oldest time.Time
@@ -178,38 +199,28 @@ func (m *TaskManager) pruneFinishedLocked() {
 		}
 	}
 	if oldestID != "" {
+		session := m.sessions[oldestID]
 		delete(m.sessions, oldestID)
+		return session
 	}
+	return nil
 }
 
 func (m *TaskManager) wait(session *taskSession) {
-	err := session.cmd.Wait()
+	_ = session.cmd.Wait()
 	now := time.Now()
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.status == TaskRunning {
 		session.status = TaskExited
 	}
-	if session.status == TaskStopped && session.signal == "" {
-		session.signal = signalFromWaitError(err)
-	}
+	session.signal = processSignal(session.cmd.ProcessState)
 	if session.exitCode == nil && session.cmd.ProcessState != nil {
 		code := session.cmd.ProcessState.ExitCode()
 		session.exitCode = &code
 	}
 	session.finishedAt = &now
 	close(session.done)
-}
-
-func (m *TaskManager) watchContext(ctx context.Context, session *taskSession) {
-	if ctx == nil {
-		return
-	}
-	select {
-	case <-ctx.Done():
-		_ = m.Stop(context.Background(), session.sessionID, "", "")
-	case <-session.done:
-	}
 }
 
 func (m *TaskManager) get(ownerID, workDir, id string) (*taskSession, error) {
@@ -305,7 +316,14 @@ func (m *TaskManager) snapshotAt(session *taskSession, maxOutput int, cursor *in
 	if cursor != nil {
 		readCursor = *cursor
 	}
-	output, next, truncated := session.log.read(readCursor, maxOutput)
+	var output string
+	var next int64
+	var truncated bool
+	if cursor == nil && session.finishedAt != nil {
+		output, next, truncated = session.log.tail(maxOutput)
+	} else {
+		output, next, truncated = session.log.read(readCursor, maxOutput)
+	}
 	snapshot.Output, snapshot.NextCursor, snapshot.OutputTruncated = output, next, truncated
 	if !explicit && cursor == nil {
 		session.serverCursor = next
@@ -362,35 +380,66 @@ func (m *TaskManager) Stop(ctx context.Context, id, ownerID, workDir string) err
 			return err
 		}
 	}
-	session.mu.Lock()
-	if session.status != TaskRunning {
-		session.mu.Unlock()
-		return nil
-	}
-	session.status = TaskStopped
-	session.stopRequested = true
-	session.signal = "SIGTERM"
-	cmd := session.cmd
-	session.mu.Unlock()
-	terminateProcess(cmd, session.done)
+	stopSessions([]*taskSession{session})
 	return nil
 }
 
+// stopSessions signals every group before waiting on one shared grace period.
+// A finished shell can still have descendants, so done alone is insufficient.
+func stopSessions(sessions []*taskSession) {
+	for _, session := range sessions {
+		session.mu.Lock()
+		if session.status == TaskRunning {
+			session.status = TaskStopped
+		}
+		session.mu.Unlock()
+		signalProcessGroup(session.cmd, false)
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+waitGroups:
+	for {
+		alive := false
+		for _, session := range sessions {
+			alive = processGroupAlive(session.cmd) || alive
+		}
+		if !alive {
+			break
+		}
+		select {
+		case <-timer.C:
+			break waitGroups
+		case <-ticker.C:
+		}
+	}
+	for _, session := range sessions {
+		signalProcessGroup(session.cmd, true)
+	}
+	// Wait owns reaping and the final signal/exit status. WaitDelay bounds pipe
+	// draining even when a descendant escaped the process group.
+	for _, session := range sessions {
+		<-session.done
+	}
+}
+
 func (m *TaskManager) Shutdown() {
-	m.mu.Lock()
-	if m.shutdown {
+	m.shutdownOnce.Do(func() {
+		m.mu.Lock()
+		m.shutdown = true
 		m.mu.Unlock()
-		return
-	}
-	m.shutdown = true
-	ids := make([]string, 0, len(m.sessions))
-	for id := range m.sessions {
-		ids = append(ids, id)
-	}
-	m.mu.Unlock()
-	for _, id := range ids {
-		_ = m.Stop(context.Background(), id, "", "")
-	}
+		// Start reserves a slot before releasing the lock. No Add can race Wait
+		// after shutdown is set, and every started process enters the snapshot.
+		m.starts.Wait()
+		m.mu.Lock()
+		sessions := make([]*taskSession, 0, len(m.sessions))
+		for _, session := range m.sessions {
+			sessions = append(sessions, session)
+		}
+		m.mu.Unlock()
+		stopSessions(sessions)
+	})
 }
 
 func normalizeOwner(ownerID string) string {
@@ -417,11 +466,4 @@ func newSessionID() (string, error) {
 		return "", err
 	}
 	return "bash-session-" + hex.EncodeToString(bytes), nil
-}
-
-func signalFromWaitError(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }

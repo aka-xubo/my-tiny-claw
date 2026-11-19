@@ -56,9 +56,25 @@ func (l *taskLog) read(cursor int64, max int) (output string, next int64, trunca
 	available := l.data[offset:]
 	if len(available) > max {
 		available = available[:max]
+		truncated = true
 	}
 	next = cursor + int64(len(available))
 	return string(available), next, truncated
+}
+
+// tail prioritizes the final diagnostics, including output lost to eviction.
+func (l *taskLog) tail(max int) (output string, next int64, truncated bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if max <= 0 {
+		max = 8000
+	}
+	data := l.data
+	truncated = l.base > 0 || len(data) > max
+	if len(data) > max {
+		data = data[len(data)-max:]
+	}
+	return string(data), l.base + int64(len(l.data)), truncated
 }
 
 func (l *taskLog) end() int64 {

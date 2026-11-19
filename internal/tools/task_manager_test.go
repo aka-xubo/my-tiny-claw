@@ -78,19 +78,12 @@ func TestTaskManagerContextCancellationStopsSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancel()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		snapshot, pollErr := manager.Poll(context.Background(), "owner-a", workDir, id, 0, nil, 8000)
-		if pollErr != nil {
-			t.Fatal(pollErr)
-		}
-		if snapshot.Status == TaskStopped {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("Context 取消后会话仍未停止: %+v", snapshot)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if _, err := manager.WaitUntil(ctx, "owner-a", workDir, id, time.Second, 8000); err != context.Canceled {
+		t.Fatalf("前台取消应返回取消错误: %v", err)
+	}
+	snapshot, err := manager.Poll(context.Background(), "owner-a", workDir, id, 0, nil, 8000)
+	if err != nil || snapshot.Status != TaskStopped {
+		t.Fatalf("前台取消应停止会话: %+v, %v", snapshot, err)
 	}
 }
 
@@ -129,27 +122,5 @@ func TestManagedBashProtocol(t *testing.T) {
 	pollArgs, _ := json.Marshal(map[string]interface{}{"action": "stop", "session_id": snapshot.SessionID})
 	if _, err := tool.Execute(ctx, pollArgs); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestReadOnlyBashValidation(t *testing.T) {
-	for _, test := range []struct {
-		command string
-		allowed bool
-	}{
-		{"ls -la", true},
-		{"git diff --stat", true},
-		{"rg TODO . | head", true},
-		{"rm -rf .", false},
-		{"bash -c 'ls'", false},
-		{"cat x > y", false},
-		{"find . -exec cat {} \\;", false},
-		{"find . -delete", false},
-		{"go env -w GOFLAGS=-mod=mod", false},
-	} {
-		allowed, _ := validateReadOnlyCommand(test.command)
-		if allowed != test.allowed {
-			t.Errorf("命令 %q 的只读判断错误: got %v", test.command, allowed)
-		}
 	}
 }

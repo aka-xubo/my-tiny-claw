@@ -102,6 +102,7 @@ func runCLI() error {
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: *promptPtr})
 	// 6. 启动 Main Loop！
 	err = eng.Run(ctx, sess, reporter)
+	stopSignal() // A second interrupt during cleanup uses the default behavior.
 	// 先停止后台会话，再关闭 MCP 和导出本次 Trace。
 	taskManager.Shutdown()
 	closeErr := mcpManager.Close()

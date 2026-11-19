@@ -2,15 +2,29 @@
 
 package tools
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+	"syscall"
+)
 
-// Windows Job Object support is intentionally deferred to a later phase. This
-// keeps the first implementation buildable on Windows while preserving the
-// process control abstraction used by TaskManager.
+// Job Objects are deferred; Windows currently stops only the direct child.
 func configureProcess(cmd *exec.Cmd) {}
 
-func terminateProcess(cmd *exec.Cmd, _ <-chan struct{}) {
+func signalProcessGroup(cmd *exec.Cmd, _ bool) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 	}
 }
+
+func processGroupAlive(cmd *exec.Cmd) bool {
+	handle, err := syscall.OpenProcess(syscall.SYNCHRONIZE, false, uint32(cmd.Process.Pid))
+	if err != nil {
+		return false
+	}
+	defer syscall.CloseHandle(handle)
+	status, err := syscall.WaitForSingleObject(handle, 0)
+	return err == nil && status == syscall.WAIT_TIMEOUT
+}
+
+func processSignal(_ *os.ProcessState) string { return "" }
