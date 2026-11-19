@@ -100,6 +100,8 @@ func runCLI() error {
 	rootSpan.AddAttribute("Prompt", *promptPtr)
 	// 5. 初始化彩色终端输出器
 	reporter := engine.NewTerminalReporter()
+	// 日志写入前先结束流式输出停在行中间的那一行，避免日志粘在回复末尾
+	log.SetOutput(reporter.LogWriter(os.Stderr))
 	fmt.Printf("\n🎯 收到任务: %s\n\n", *promptPtr)
 	// 将用户的 Prompt 压入 Session 记忆
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: *promptPtr})

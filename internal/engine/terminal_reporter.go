@@ -17,6 +17,8 @@ type TerminalReporter struct {
 	mu sync.Mutex
 	// streaming 记录当前正在输出的流类型（"thinking" / "message"），空表示没有流在输出
 	streaming string
+	// midLine 表示流式文本停在行中间（最后一个增量不以换行结尾）
+	midLine bool
 }
 
 const (
@@ -86,32 +88,51 @@ func (r *TerminalReporter) writeDelta(kind, header, delta string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.streaming != kind {
-		if r.streaming != "" {
-			fmt.Fprint(r.writer(), "\n")
-		}
+		r.endLineLocked()
 		r.streaming = kind
 		fmt.Fprint(r.writer(), header)
 	}
 	fmt.Fprint(r.writer(), delta)
+	r.midLine = !strings.HasSuffix(delta, "\n")
+}
+
+// endLineLocked 在流式文本停在行中间时补一个换行。调用方需持有 r.mu。
+func (r *TerminalReporter) endLineLocked() {
+	if r.midLine {
+		fmt.Fprint(r.writer(), "\n")
+		r.midLine = false
+	}
 }
 
 func (r *TerminalReporter) OnStreamDone(ctx context.Context, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.streaming == "" {
-		if err != nil {
-			fmt.Fprintf(r.writer(), "[⚠️ 输出中断] %v\n", err)
-		}
-		return
-	}
+	r.endLineLocked()
 	if err != nil {
-		fmt.Fprintf(r.writer(), "\n[⚠️ 输出中断] %v\n", err)
+		fmt.Fprintf(r.writer(), "[⚠️ 输出中断] %v\n", err)
 	} else if r.streaming == streamMessage {
-		fmt.Fprint(r.writer(), "\n\n")
-	} else {
-		fmt.Fprint(r.writer(), "\n")
+		fmt.Fprint(r.writer(), "\n") // 回复结束后空一行
 	}
 	r.streaming = ""
+}
+
+// LogWriter 包装日志输出（通常是 os.Stderr）。写日志前，如果流式文本停在行中间，
+// 先在终端补一个换行，避免 [Tracker] 等日志粘在流式文本末尾。
+// 用法：log.SetOutput(reporter.LogWriter(os.Stderr))
+func (r *TerminalReporter) LogWriter(w io.Writer) io.Writer {
+	return &lineAwareLogWriter{r: r, w: w}
+}
+
+type lineAwareLogWriter struct {
+	r *TerminalReporter
+	w io.Writer
+}
+
+func (l *lineAwareLogWriter) Write(p []byte) (int, error) {
+	l.r.mu.Lock()
+	defer l.r.mu.Unlock()
+	l.r.endLineLocked()
+	return l.w.Write(p)
 }
 
 var _ Reporter = (*TerminalReporter)(nil)
