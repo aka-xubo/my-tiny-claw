@@ -90,11 +90,16 @@ func (t *BashTool) executeReadOnly(ctx context.Context, command string) (string,
 	// The one-shot tool never leaves background descendants behind.
 	signalProcessGroup(cmd, true)
 	text, _, truncated := output.tail(8000)
-	if err != nil {
-		return "", fmt.Errorf("只读 bash 执行失败: %w\n%s", err, text)
-	}
 	if truncated {
 		text += "\n[终端输出过长，已保留最后 8000 字节]"
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return text + "\n[警告: 命令执行超时(最长30s)，已被系统强制终止。]", nil
+	}
+	// Match the one-shot BashTool contract: command failures are ordinary
+	// results so the model can inspect diagnostics and correct its command.
+	if err != nil {
+		return fmt.Sprintf("执行报错: %v\n输出:\n%s", err, text), nil
 	}
 	if text == "" {
 		text = "命令执行成功，无终端输出。"

@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -25,11 +27,10 @@ func TestFinishedOutputPrioritizesTailAndPreservesReplay(t *testing.T) {
 	if s.NextCursor != session.log.end() || session.serverCursor != s.NextCursor {
 		t.Fatalf("tail must advance to end: %+v", s)
 	}
-	// An implicit poll of an exited session replays final diagnostics even after
-	// the initial response consumed the server cursor.
+	// An implicit poll must not replay diagnostics consumed by the first response.
 	poll, err := m.Poll(context.Background(), "o", dir, id, 0, nil, 100)
-	if err != nil || !strings.HasSuffix(poll.Output, "TAIL_MARKER") || !poll.OutputTruncated || len(poll.Output) != 100 {
-		t.Fatalf("finished poll must return tail: %+v, %v", poll, err)
+	if err != nil || poll.Output != "" || poll.OutputTruncated || poll.NextCursor != s.NextCursor {
+		t.Fatalf("finished poll repeated consumed output: %+v, %v", poll, err)
 	}
 	cursor := s.NextCursor - 11
 	poll, err = m.Poll(context.Background(), "o", dir, id, 0, &cursor, 8000)
@@ -40,6 +41,58 @@ func TestFinishedOutputPrioritizesTailAndPreservesReplay(t *testing.T) {
 	poll, err = m.Poll(context.Background(), "o", dir, id, 0, &cursor, 8000)
 	if err != nil || poll.Output != "" {
 		t.Fatalf("explicit end cursor should be empty: %+v, %v", poll, err)
+	}
+}
+
+func TestFinishedPollReturnsOnlyUnreadOutput(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		command   string
+		max       int
+		want      string
+		truncated bool
+	}{
+		{"no new output", ":", 8000, "", false},
+		{"short output", "printf BBBB", 8000, "BBBB", false},
+		{"unread tail", "printf BBBBBBBBBBBBBBBBBBBBTAIL", 8, "BBBBTAIL", true},
+		{"evicted unread tail", "seq 1 30000; printf TAIL_MARKER", 11, "TAIL_MARKER", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := NewTaskManager()
+			defer m.Shutdown()
+			dir := t.TempDir()
+			id, err := m.Start(context.Background(), "o", dir,
+				"printf 'AAAA\\n'; while [ ! -f finish ]; do sleep 0.01; done; "+test.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := m.Poll(context.Background(), "o", dir, id, 5*time.Second, nil, 8000)
+			if err != nil || first.Output != "AAAA\n" || first.Status != TaskRunning {
+				t.Fatalf("missing initial running output: %+v %v", first, err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "finish"), []byte("ready"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			session, err := m.get("o", dir, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-session.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("command did not exit")
+			}
+			final, err := m.Poll(context.Background(), "o", dir, id, 0, nil, test.max)
+			if err != nil || final.Status != TaskExited || final.Output != test.want || final.OutputTruncated != test.truncated {
+				t.Fatalf("wrong unread output after exit: %+v %v", final, err)
+			}
+			for i := 0; i < 2; i++ {
+				again, err := m.Poll(context.Background(), "o", dir, id, 0, nil, test.max)
+				if err != nil || again.Output != "" || again.OutputTruncated || again.NextCursor != final.NextCursor {
+					t.Fatalf("repeated poll replayed output: %+v %v", again, err)
+				}
+			}
+		})
 	}
 }
 

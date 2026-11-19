@@ -151,3 +151,58 @@ func TestReadOnlyBashDeniesTCPAndHostUnixSockets(t *testing.T) {
 		})
 	}
 }
+
+func TestReadOnlyBashCommandFailuresRemainOrdinaryResults(t *testing.T) {
+	requireReadOnlySandbox(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "input.txt"), []byte("present\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewRegistry()
+	registry.Register(NewReadOnlyBashTool(dir))
+	registry.Use(NewReadOnlyBashMiddleware())
+	for _, test := range []struct {
+		name, command, want string
+		truncated           bool
+	}{
+		{"grep no match", "grep absent input.txt", "exit status 1", false},
+		{"nonzero stderr", "printf DIAGNOSTIC >&2; exit 7", "DIAGNOSTIC", false},
+		{"long failure", "seq 1 30000; printf TAIL_MARKER >&2; exit 7", "TAIL_MARKER", true},
+		{"long success", "seq 1 30000; printf TAIL_MARKER", "TAIL_MARKER", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args, _ := json.Marshal(bashArgs{Command: test.command})
+			result := registry.Execute(context.Background(), schema.ToolCall{Name: "bash", Arguments: args})
+			if result.IsError || !strings.Contains(result.Output, test.want) {
+				t.Fatalf("command result became a tool error or lost diagnostics: %+v", result)
+			}
+			if test.name != "long success" && !strings.HasPrefix(result.Output, "执行报错:") {
+				t.Fatalf("missing ordinary command failure message: %s", result.Output)
+			}
+			if strings.Contains(result.Output, "终端输出过长") != test.truncated {
+				t.Fatalf("wrong truncation notice: %s", result.Output)
+			}
+			if len(result.Output) > 8500 {
+				t.Fatalf("response output is unbounded: %d", len(result.Output))
+			}
+		})
+	}
+}
+
+func TestReadOnlyBashTimeoutPreservesDiagnosticsAndTruncation(t *testing.T) {
+	requireReadOnlySandbox(t)
+	registry := NewRegistry()
+	registry.Register(NewReadOnlyBashTool(t.TempDir()))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	args, _ := json.Marshal(bashArgs{Command: "seq 1 30000; printf TAIL_MARKER; sleep 10"})
+	result := registry.Execute(ctx, schema.ToolCall{Name: "bash", Arguments: args})
+	if result.IsError || !strings.Contains(result.Output, "TAIL_MARKER") ||
+		!strings.Contains(result.Output, "命令执行超时") || !strings.Contains(result.Output, "强制终止") ||
+		!strings.Contains(result.Output, "终端输出过长") {
+		t.Fatalf("timeout lost ordinary result semantics or diagnostics: %+v", result)
+	}
+	if len(result.Output) > 8500 {
+		t.Fatalf("timeout response output is unbounded: %d", len(result.Output))
+	}
+}

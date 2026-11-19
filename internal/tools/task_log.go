@@ -64,17 +64,31 @@ func (l *taskLog) read(cursor int64, max int) (output string, next int64, trunca
 
 // tail prioritizes the final diagnostics, including output lost to eviction.
 func (l *taskLog) tail(max int) (output string, next int64, truncated bool) {
+	return l.tailFrom(0, max)
+}
+
+// tailFrom returns the tail of the unread range without replaying consumed
+// bytes. Reaching the end consumes that range, including any skipped bytes.
+func (l *taskLog) tailFrom(cursor int64, max int) (output string, next int64, truncated bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if max <= 0 {
 		max = 8000
 	}
-	data := l.data
-	truncated = l.base > 0 || len(data) > max
+	if cursor < l.base {
+		cursor = l.base
+		truncated = true
+	}
+	end := l.base + int64(len(l.data))
+	if cursor > end {
+		cursor = end
+	}
+	data := l.data[int(cursor-l.base):]
 	if len(data) > max {
 		data = data[len(data)-max:]
+		truncated = true
 	}
-	return string(data), l.base + int64(len(l.data)), truncated
+	return string(data), end, truncated
 }
 
 func (l *taskLog) end() int64 {

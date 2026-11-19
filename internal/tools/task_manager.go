@@ -320,7 +320,7 @@ func (m *TaskManager) snapshotAt(session *taskSession, maxOutput int, cursor *in
 	var next int64
 	var truncated bool
 	if cursor == nil && session.finishedAt != nil {
-		output, next, truncated = session.log.tail(maxOutput)
+		output, next, truncated = session.log.tailFrom(readCursor, maxOutput)
 	} else {
 		output, next, truncated = session.log.read(readCursor, maxOutput)
 	}

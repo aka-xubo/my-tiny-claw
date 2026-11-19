@@ -33,9 +33,13 @@ func (t *BashTool) Name() string {
 }
 
 func (t *BashTool) Definition() schema.ToolDefinition {
+	description := "在当前工作区执行 bash 命令。短命令直接返回；需要持续运行的命令会返回 session_id，可使用 poll、list、stop 查看或管理后台会话。"
+	if t.readOnly {
+		description = "在只读隔离中同步执行 bash 搜索与读取命令，最多运行 30 秒。禁止文件写入和网络访问，也不能在 /tmp 等目录创建临时文件；mktemp、需要临时文件的部分 go 子命令会失败。不支持后台会话。"
+	}
 	return schema.ToolDefinition{
 		Name:        t.Name(),
-		Description: "在当前工作区执行 bash 命令。短命令直接返回；需要持续运行的命令会返回 session_id，可使用 poll、list、stop 查看或管理后台会话。",
+		Description: description,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
