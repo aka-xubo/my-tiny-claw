@@ -56,9 +56,39 @@ func (l *taskLog) read(cursor int64, max int) (output string, next int64, trunca
 	available := l.data[offset:]
 	if len(available) > max {
 		available = available[:max]
+		truncated = true
 	}
 	next = cursor + int64(len(available))
 	return string(available), next, truncated
+}
+
+// tail prioritizes the final diagnostics, including output lost to eviction.
+func (l *taskLog) tail(max int) (output string, next int64, truncated bool) {
+	return l.tailFrom(0, max)
+}
+
+// tailFrom returns the tail of the unread range without replaying consumed
+// bytes. Reaching the end consumes that range, including any skipped bytes.
+func (l *taskLog) tailFrom(cursor int64, max int) (output string, next int64, truncated bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if max <= 0 {
+		max = 8000
+	}
+	if cursor < l.base {
+		cursor = l.base
+		truncated = true
+	}
+	end := l.base + int64(len(l.data))
+	if cursor > end {
+		cursor = end
+	}
+	data := l.data[int(cursor-l.base):]
+	if len(data) > max {
+		data = data[len(data)-max:]
+		truncated = true
+	}
+	return string(data), end, truncated
 }
 
 func (l *taskLog) end() int64 {

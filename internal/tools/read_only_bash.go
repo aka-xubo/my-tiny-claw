@@ -4,25 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
-	"unicode"
+	"os/exec"
+	"runtime"
+	"time"
 
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 )
 
-var readOnlyCommands = map[string]bool{
-	"ls": true, "pwd": true, "find": true, "grep": true, "rg": true,
-	"cat": true, "head": true, "tail": true, "git": true, "go": true,
-	"sed": true,
-}
-
-// NewReadOnlyBashTool adds a second, tool-level guard for subagents. The
-// registry middleware remains the first guard so rejected calls are visible
-// before Execute is reached.
 func NewReadOnlyBashTool(workDir string) *BashTool {
 	return &BashTool{workDir: workDir, readOnly: true}
 }
 
+// The middleware limits the protocol. The tool itself enforces OS isolation,
+// including when called directly, rather than attempting to classify shell text.
 func NewReadOnlyBashMiddleware() MiddlewareFunc {
 	return func(_ context.Context, call schema.ToolCall) (bool, string) {
 		if call.Name != "bash" {
@@ -32,79 +26,83 @@ func NewReadOnlyBashMiddleware() MiddlewareFunc {
 		if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			return false, fmt.Sprintf("bash 参数解析失败: %v", err)
 		}
-		if args.Action != "" {
-			return false, "子 Agent 只能执行一次性只读 bash 命令，不允许管理后台会话"
+		if args.Action != "" || args.SessionID != "" {
+			return false, "子 Agent 不允许管理后台会话"
 		}
-		if ok, reason := validateReadOnlyCommand(args.Command); !ok {
-			return false, reason
+		if args.Command == "" {
+			return false, "bash 命令不能为空"
 		}
 		return true, ""
 	}
 }
 
-func validateReadOnlyCommand(command string) (bool, string) {
-	command = strings.TrimSpace(command)
-	if command == "" {
-		return false, "bash 命令不能为空"
+// Descendants inherit the sandbox: flags, scripts, shell quoting and command
+// substitutions cannot escape the filesystem restriction. No writable mounts
+// or network are provided. Unsupported hosts fail closed.
+func readOnlyCommand(ctx context.Context, command string) (*exec.Cmd, func(), error) {
+	switch runtime.GOOS {
+	case "darwin":
+		const profile = `(version 1)
+(deny default)
+(allow file-read*)
+(allow file-write-data (literal "/dev/null"))
+(allow process-exec)
+(allow process-fork)
+(allow sysctl-read)`
+		return exec.CommandContext(ctx, "/usr/bin/sandbox-exec", "-p", profile,
+			"/bin/bash", "--noprofile", "--norc", "-c", command), func() {}, nil
+	case "linux":
+		// Use the system-installed bubblewrap, never a workspace/PATH executable.
+		cmd := exec.CommandContext(ctx, "/usr/bin/bwrap", "--unshare-all",
+			"--die-with-parent", "--new-session", "--cap-drop", "ALL",
+			"--ro-bind", "/", "/", "--proc", "/proc", "--remount-ro", "/proc",
+			"--dev", "/dev", "--seccomp", "3",
+			"/bin/bash", "--noprofile", "--norc", "-c", command)
+		cleanup, err := restrictReadOnlyLinux(cmd)
+		return cmd, cleanup, err
+	default:
+		return nil, nil, fmt.Errorf("当前系统不支持只读 bash 隔离，已拒绝执行")
 	}
-	for _, r := range command {
-		if unicode.IsControl(r) && r != '\t' && r != '\n' {
-			return false, "命令包含不允许的控制字符"
-		}
-	}
-	if strings.Contains(command, "$(") || strings.Contains(command, "${") || strings.ContainsRune(command, '`') {
-		return false, "禁止命令替换或反引号"
-	}
-	// &&/|| are normalized to pipeline separators and each segment is checked
-	// independently. A lone &, semicolon, or redirection remains forbidden.
-	command = strings.ReplaceAll(command, "&&", "|")
-	command = strings.ReplaceAll(command, "||", "|")
-	for _, forbidden := range []string{">", "<", "&", ";", "find -exec", "find . -exec", "xargs", "awk", "system(", "sudo", "rm ", "mv ", "cp ", "mkdir", "touch", "chmod", "chown", "npm install", "npm i ", "pip install", "go install", "python -c", "python3 -c", "bash -c", "sh -c"} {
-		if strings.Contains(command, forbidden) {
-			return false, fmt.Sprintf("命令包含被禁止的写入或嵌套 Shell 操作: %s", forbidden)
-		}
-	}
+}
 
-	segments := strings.FieldsFunc(command, func(r rune) bool {
-		return r == '|' || r == ';' || r == '\n'
-	})
-	for _, segment := range segments {
-		fields := strings.Fields(strings.TrimSpace(segment))
-		if len(fields) == 0 {
-			continue
-		}
-		name := fields[0]
-		if name == "&&" || name == "||" {
-			continue
-		}
-		if !readOnlyCommands[name] {
-			return false, fmt.Sprintf("子 Agent 只允许只读命令，当前命令不在白名单: %s", name)
-		}
-		if name == "git" && len(fields) > 1 {
-			switch fields[1] {
-			case "status", "diff", "log", "show":
-			default:
-				return false, "git 只允许 status、diff、log、show"
-			}
-		}
-		if name == "go" {
-			if len(fields) < 2 || fields[1] != "env" {
-				return false, "go 只允许 env"
-			}
-			if len(fields) > 2 && (fields[2] == "-w" || fields[2] == "-u") {
-				return false, "go env 不允许修改环境配置"
-			}
-		}
-		if name == "find" {
-			for _, field := range fields[1:] {
-				if field == "-delete" || field == "-exec" || field == "-execdir" || field == "-ok" || field == "-okdir" {
-					return false, "find 只允许读取，禁止执行或删除动作"
-				}
-			}
-		}
-		if name == "sed" && !strings.Contains(segment, "-n") {
-			return false, "sed 只允许使用 -n 读取内容"
-		}
+func (t *BashTool) executeReadOnly(ctx context.Context, command string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd, cleanup, err := readOnlyCommand(ctx, command)
+	if err != nil {
+		return "", err
 	}
-	return true, ""
+	defer cleanup()
+	cmd.Dir = t.workDir
+	configureProcess(cmd)
+	cmd.Cancel = func() error {
+		signalProcessGroup(cmd, true)
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
+	// Bound memory even if a sandboxed command prints indefinitely.
+	output := newTaskLog(defaultTaskLogLimit)
+	cmd.Stdout, cmd.Stderr = output, output
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("无法启动只读 bash 隔离，已拒绝执行: %w", err)
+	}
+	err = cmd.Wait()
+	// The one-shot tool never leaves background descendants behind.
+	signalProcessGroup(cmd, true)
+	text, _, truncated := output.tail(8000)
+	if truncated {
+		text += "\n[终端输出过长，已保留最后 8000 字节]"
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return text + "\n[警告: 命令执行超时(最长30s)，已被系统强制终止。]", nil
+	}
+	// Match the one-shot BashTool contract: command failures are ordinary
+	// results so the model can inspect diagnostics and correct its command.
+	if err != nil {
+		return fmt.Sprintf("执行报错: %v\n输出:\n%s", err, text), nil
+	}
+	if text == "" {
+		text = "命令执行成功，无终端输出。"
+	}
+	return text, nil
 }
