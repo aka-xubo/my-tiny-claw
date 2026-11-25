@@ -38,23 +38,35 @@ func NewCostTracker(next provider.LLMProvider, modelName string, session *cctx.S
 
 // Generate 实现了 LLMProvider 接口！这意味着它可以被无缝注入到 Main Loop 中。
 func (t *CostTracker) Generate(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition) (*schema.Message, error) {
-
-	// 1. 记录请求发起的时刻
 	startTime := time.Now()
-
-	// 2. 调用真实的底层大模型去执行耗时的网络请求
 	respMsg, err := t.nextProvider.Generate(ctx, msgs, availableTools)
+	return t.record(respMsg, err, time.Since(startTime))
+}
 
-	// 3. 计算耗时
-	latency := time.Since(startTime)
+// GenerateStream 让 CostTracker 同时满足 provider.StreamingProvider。
+// 底层支持流式就透传；不支持则退回 Generate，并把完整内容一次性交给 onDelta。
+func (t *CostTracker) GenerateStream(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition, onDelta provider.StreamHandler) (*schema.Message, error) {
+	startTime := time.Now()
+	streaming, ok := t.nextProvider.(provider.StreamingProvider)
+	if !ok {
+		respMsg, err := t.nextProvider.Generate(ctx, msgs, availableTools)
+		if err == nil && respMsg != nil && respMsg.Content != "" && onDelta != nil {
+			onDelta(respMsg.Content)
+		}
+		return t.record(respMsg, err, time.Since(startTime))
+	}
+	respMsg, err := streaming.GenerateStream(ctx, msgs, availableTools, onDelta)
+	return t.record(respMsg, err, time.Since(startTime))
+}
 
+func (t *CostTracker) record(respMsg *schema.Message, err error, latency time.Duration) (*schema.Message, error) {
 	// 如果报错了，只打印报错时间，不计费
 	if err != nil {
 		log.Printf("[Tracker] ❌ API 调用失败，耗时: %v\n", latency)
 		return respMsg, err
 	}
 
-	// 4. 解析 Token 并计算成本
+	// 解析 Token 并计算成本
 	if respMsg.Usage != nil {
 		promptTokens := respMsg.Usage.PromptTokens
 		completionTokens := respMsg.Usage.CompletionTokens
@@ -65,11 +77,10 @@ func (t *CostTracker) Generate(ctx context.Context, msgs []schema.Message, avail
 			cost = (float64(promptTokens)*price.InputPrice + float64(completionTokens)*price.OutputPrice) / 1000000.0
 		}
 
-		// 5. 打印精美的仪表盘日志
 		log.Printf("[Tracker] 📊 API 调用完成 | 耗时: %v | 输入: %d tk | 输出: %d tk | 花费: ¥%.6f\n",
 			latency, promptTokens, completionTokens, cost)
 
-		// 6. 将账单累加到当前的 Session 中，供人类后续随时查询
+		// 将账单累加到当前的 Session 中，供人类后续随时查询
 		if t.session != nil {
 			t.session.RecordUsage(promptTokens, completionTokens, cost)
 			log.Printf("[Tracker] 💰 当前会话 (%s) 累计花费: ¥%.6f\n", t.session.ID, t.session.TotalCostCNY)
@@ -80,3 +91,5 @@ func (t *CostTracker) Generate(ctx context.Context, msgs []schema.Message, avail
 
 	return respMsg, nil
 }
+
+var _ provider.StreamingProvider = (*CostTracker)(nil)

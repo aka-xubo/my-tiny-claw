@@ -20,9 +20,11 @@ type AgentEngine struct {
 	EnableThinking     bool
 	PlanMode           bool // 【新增】暴露给外部的计划模式开关
 	SandboxDescription string
-	compactor          *cctx.Compactor
-	recovery           *cctx.RecoveryManager
-	injector           *ReminderInjector // 【新增】提醒注入器
+	// Stream 打开时，若 Provider 和 Reporter 都支持流式，Thinking 与 Action 阶段会实时输出增量
+	Stream    bool
+	compactor *cctx.Compactor
+	recovery  *cctx.RecoveryManager
+	injector  *ReminderInjector // 【新增】提醒注入器
 }
 
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, enableThinking bool) *AgentEngine {
@@ -85,7 +87,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 			}
 			// 【埋点 3】：记录 Thinking 调用 thinkCtx,
 			thinkCtx, thinkSpan := observability.StartSpan(turnCtx, "LLM.Thinking")
-			thinkResp, err := e.provider.Generate(thinkCtx, compactedContext, nil)
+			thinkResp, _, err := e.generate(thinkCtx, compactedContext, nil, reporter, streamThinking)
 			thinkSpan.EndSpan() // 结束思考跨度
 			if err != nil {
 				return fmt.Errorf("Thinking 阶段失败: %w", err)
@@ -99,7 +101,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 
 		// ================= Phase 2: Action =================
 		actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
-		actionResp, err := e.provider.Generate(actCtx, compactedContext, availableTools)
+		actionResp, actionStreamed, err := e.generate(actCtx, compactedContext, availableTools, reporter, streamMessage)
 		actSpan.EndSpan()
 		if err != nil {
 			return fmt.Errorf("Action 阶段失败: %w", err)
@@ -115,7 +117,8 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 		session.Append(finalAssistantMsg)
 		compactedContext = append(compactedContext, *actionResp)
 
-		if actionResp.Content != "" && reporter != nil {
+		// 流式路径已经实时展示过回复，不再重复调用 OnMessage
+		if actionResp.Content != "" && reporter != nil && !actionStreamed {
 			reporter.OnMessage(ctx, actionResp.Content)
 		}
 
@@ -194,6 +197,26 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 	}
 
 	return nil
+}
+
+// generate 统一封装一次模型调用。只有开启 Stream、Provider 实现 StreamingProvider、
+// Reporter 实现 StreamReporter 三者同时满足时才走流式，streamed 返回 true；
+// 否则退回原来的 Generate。kind 决定增量交给 OnThinkingDelta 还是 OnMessageDelta。
+func (e *AgentEngine) generate(ctx context.Context, msgs []schema.Message, availableTools []schema.ToolDefinition, reporter Reporter, kind string) (resp *schema.Message, streamed bool, err error) {
+	streamingProvider, providerOK := e.provider.(provider.StreamingProvider)
+	streamReporter, reporterOK := reporter.(StreamReporter)
+	if !e.Stream || !providerOK || !reporterOK {
+		resp, err = e.provider.Generate(ctx, msgs, availableTools)
+		return resp, false, err
+	}
+
+	onDelta := func(delta string) { streamReporter.OnMessageDelta(ctx, delta) }
+	if kind == streamThinking {
+		onDelta = func(delta string) { streamReporter.OnThinkingDelta(ctx, delta) }
+	}
+	resp, err = streamingProvider.GenerateStream(ctx, msgs, availableTools, onDelta)
+	streamReporter.OnStreamDone(ctx, err)
+	return resp, true, err
 }
 
 func hasReadSkillCall(calls []schema.ToolCall) bool {

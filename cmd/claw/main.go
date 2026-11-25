@@ -48,6 +48,8 @@ func runCLI() error {
 	sessionPtr := flag.String("session", "cli_default_session", "指定会话 ID，支持断点续传")
 	permissionsPtr := flag.String("permissions", "", "默认权限档（默认读取配置，未配置时为 :workspace）")
 	approvalPtr := flag.String("approval", "", "审批策略：untrusted、on-request、never（默认读取配置）")
+	thinkingPtr := flag.Bool("thinking", false, "开启慢思考 (Thinking) 阶段，流式模式下会实时展示思考内容")
+	streamPtr := flag.Bool("stream", true, "实时流式输出模型回复（-stream=false 关闭）")
 	flag.Parse()
 	// 解析工作区绝对路径
 	workDir, err := filepath.Abs(*workDirPtr)
@@ -166,14 +168,17 @@ func runCLI() error {
 	}
 	// 文件和 bash 权限由 sandbox.Session 统一审批与执行。
 	// 4. 初始化核心引擎 (组装器内部会自动加载 Composer, Compactor, Recovery, Reminders)
-	// 开启 EnableThinking = true
-	eng := engine.NewAgentEngine(trackedProvider, registry, true, false)
+	// PlanMode 默认开启；Thinking 由 -thinking 控制
+	eng := engine.NewAgentEngine(trackedProvider, registry, true, *thinkingPtr)
+	eng.Stream = *streamPtr
 	eng.SandboxDescription = sandboxSession.Description()
 	// 【追踪装配】：初始化链路追踪 Root Span
 	ctx, rootSpan := observability.StartSpan(runCtx, "CLI.TaskRun")
 	rootSpan.AddAttribute("Prompt", *promptPtr)
 	// 5. 初始化彩色终端输出器
 	reporter := engine.NewTerminalReporter()
+	// 日志写入前先结束流式输出停在行中间的那一行，避免日志粘在回复末尾
+	log.SetOutput(reporter.LogWriter(os.Stderr))
 	if *promptPtr == "" {
 		rootSpan.EndSpan()
 		defer mcpManager.Close()
