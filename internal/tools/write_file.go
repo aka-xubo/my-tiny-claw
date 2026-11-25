@@ -5,18 +5,25 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
+	"github.com/aka-xubo/my-tiny-claw/internal/fshelper"
+	"github.com/aka-xubo/my-tiny-claw/internal/sandbox"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 )
 
 type WriteFileTool struct {
-	workDir string // 工作区约束
+	workDir    string // 工作区约束
+	session    *sandbox.Session
+	sessionErr error
 }
 
 func NewWriteFileTool(workDir string) *WriteFileTool {
-	return &WriteFileTool{workDir: workDir}
+	session, err := defaultSandboxSession(workDir)
+	return &WriteFileTool{workDir: workDir, session: session, sessionErr: err}
+}
+
+func NewWriteFileToolWithSandbox(workDir string, session *sandbox.Session) *WriteFileTool {
+	return &WriteFileTool{workDir: workDir, session: session}
 }
 
 func (t *WriteFileTool) Name() string {
@@ -24,9 +31,9 @@ func (t *WriteFileTool) Name() string {
 }
 
 func (t *WriteFileTool) Definition() schema.ToolDefinition {
-	return schema.ToolDefinition{
+	result := schema.ToolDefinition{
 		Name:        t.Name(),
-		Description: "创建或覆盖写入一个文件。如果目录不存在会自动创建。请提供相对于工作区的相对路径。",
+		Description: "创建或覆盖写入一个文件。如果目录不存在会自动创建。支持工作区相对路径和绝对路径；可写范围由权限档决定。",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -42,11 +49,14 @@ func (t *WriteFileTool) Definition() schema.ToolDefinition {
 			"required": []string{"path", "content"},
 		},
 	}
+	addSandboxProperties(result.InputSchema.(map[string]interface{})["properties"].(map[string]interface{}))
+	return result
 }
 
 type writeFileArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	sandboxToolArgs
 }
 
 func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -54,20 +64,25 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	if err := json.Unmarshal(args, &input); err != nil {
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
-
-	// 【安全防线】：限制在 WorkDir 下执行，防止大模型修改系统级文件
-	fullPath := filepath.Join(t.workDir, input.Path)
-
-	// 自动创建缺失的父级目录
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return "", fmt.Errorf("创建父目录失败: %w", err)
+	if t.sessionErr != nil {
+		return "", t.sessionErr
+	}
+	if t.session == nil {
+		return "", fmt.Errorf("沙箱会话未初始化，已拒绝执行")
 	}
 
-	// 写入文件内容，权限设为 0644
-	err := os.WriteFile(fullPath, []byte(input.Content), 0644)
+	path := resolveToolPath(t.workDir, input.Path)
+	call, err := input.sandboxToolArgs.call("write_file", "", t.workDir, "write", path)
 	if err != nil {
-		return "", fmt.Errorf("写入文件失败: %w", err)
+		return "", err
 	}
-
+	profile, err := t.session.Authorize(ctx, call)
+	if err != nil {
+		return "", err
+	}
+	if _, err := runFileHelper(ctx, t.session, profile, t.workDir, fshelper.Request{Op: "write", Path: path, Content: input.Content, CreateParents: true}); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf("成功将内容写入到文件: %s", input.Path), nil
+
 }

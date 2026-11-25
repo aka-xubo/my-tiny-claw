@@ -15,10 +15,11 @@ import (
 )
 
 type AgentEngine struct {
-	provider       provider.LLMProvider
-	registry       tools.Registry
-	EnableThinking bool
-	PlanMode       bool // 【新增】暴露给外部的计划模式开关
+	provider           provider.LLMProvider
+	registry           tools.Registry
+	EnableThinking     bool
+	PlanMode           bool // 【新增】暴露给外部的计划模式开关
+	SandboxDescription string
 	// Stream 打开时，若 Provider 和 Reporter 都支持流式，Thinking 与 Action 阶段会实时输出增量
 	Stream    bool
 	compactor *cctx.Compactor
@@ -54,7 +55,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 		_ = observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID)
 		log.Printf("📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下\n")
 	}()
-	composer := cctx.NewPromptComposer(session.WorkDir, e.PlanMode)
+	composer := cctx.NewPromptComposerWithSandbox(session.WorkDir, e.PlanMode, e.SandboxDescription)
 	systemMsg := composer.Build()
 	turnCount := 0
 	for {

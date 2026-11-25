@@ -13,6 +13,7 @@ require (
 require (
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
+	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/tidwall/gjson v1.19.0 // indirect

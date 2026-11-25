@@ -5,21 +5,27 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 
+	"github.com/aka-xubo/my-tiny-claw/internal/fshelper"
+	"github.com/aka-xubo/my-tiny-claw/internal/sandbox"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 )
 
 // ReadFileTool 实现了读取本地文件内容的工具
 type ReadFileTool struct {
-	// 将引擎的 WorkDir 注入给工具，限制它只能在此目录及其子目录下操作
-	workDir string
+	// 相对路径以工作区为基准，访问范围由沙箱权限档控制。
+	workDir    string
+	session    *sandbox.Session
+	sessionErr error
 }
 
 func NewReadFileTool(workDir string) *ReadFileTool {
-	return &ReadFileTool{workDir: workDir}
+	session, err := defaultSandboxSession(workDir)
+	return &ReadFileTool{workDir: workDir, session: session, sessionErr: err}
+}
+
+func NewReadFileToolWithSandbox(workDir string, session *sandbox.Session) *ReadFileTool {
+	return &ReadFileTool{workDir: workDir, session: session}
 }
 
 func (t *ReadFileTool) Name() string {
@@ -28,9 +34,9 @@ func (t *ReadFileTool) Name() string {
 
 // Definition 向大模型清晰地描述这个工具的用途和参数格式
 func (t *ReadFileTool) Definition() schema.ToolDefinition {
-	return schema.ToolDefinition{
+	result := schema.ToolDefinition{
 		Name:        t.Name(),
-		Description: "读取指定路径的文件内容。请提供相对工作区的路径。",
+		Description: "读取权限档允许的文件，支持工作区相对路径和绝对路径。默认档允许宽泛读取，内容将进入模型上下文。",
 		// 遵循 JSON Schema 规范定义参数
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -43,11 +49,14 @@ func (t *ReadFileTool) Definition() schema.ToolDefinition {
 			"required": []string{"path"},
 		},
 	}
+	addSandboxProperties(result.InputSchema.(map[string]interface{})["properties"].(map[string]interface{}))
+	return result
 }
 
 // readFileArgs 内部定义用于反序列化的结构体
 type readFileArgs struct {
 	Path string `json:"path"`
+	sandboxToolArgs
 }
 
 func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -57,30 +66,31 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		// 返回 error 会被 Registry 捕获并传给大模型，模型会知道自己 JSON 格式写错了
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
-
-	// 2. 拼接绝对路径 (注意：生产环境中需要做路径穿越检测防范，防止 ../../etc/passwd)
-	fullPath := filepath.Join(t.workDir, input.Path)
-
-	// 3. 执行物理 IO 操作
-	file, err := os.Open(fullPath)
-	if err != nil {
-		return "", fmt.Errorf("打开文件失败: %w", err)
+	if t.sessionErr != nil {
+		return "", t.sessionErr
 	}
-	defer file.Close()
-
-	content, err := io.ReadAll(file)
-	if err != nil {
-		return "", fmt.Errorf("读取文件内容失败: %w", err)
+	if t.session == nil {
+		return "", fmt.Errorf("沙箱会话未初始化，已拒绝执行")
 	}
 
-	// 4. 【核心防线】长度截断保护
-	// 为了防止大模型读取几百 MB 的日志文件导致 Context 瞬间爆炸 (OOM)，
-	// 我们在工具内部直接进行物理截断。
+	path := resolveToolPath(t.workDir, input.Path)
+	call, err := input.sandboxToolArgs.call("read_file", "", t.workDir, "read", path)
+	if err != nil {
+		return "", err
+	}
+	profile, err := t.session.Authorize(ctx, call)
+	if err != nil {
+		return "", err
+	}
+	response, err := runFileHelper(ctx, t.session, profile, t.workDir, fshelper.Request{Op: "read", Path: path, MaxBytes: 262144})
+	if err != nil {
+		return "", err
+	}
+	content := response.Content
 	const maxLen = 8000
 	if len(content) > maxLen {
-		truncatedMsg := fmt.Sprintf("%s\n\n...[由于内容过长，已被系统截断至前 %d 字节]...", string(content[:maxLen]), maxLen)
-		return truncatedMsg, nil
+		return fmt.Sprintf("%s\n\n...[由于内容过长，已被系统截断至前 %d 字节]...", content[:maxLen], maxLen), nil
 	}
+	return content, nil
 
-	return string(content), nil
 }

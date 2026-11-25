@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/aka-xubo/my-tiny-claw/internal/sandbox"
 )
 
 type TaskStatus string
@@ -28,6 +30,8 @@ var (
 )
 
 type TaskSnapshot struct {
+	Profile         string     `json:"profile,omitempty"`
+	Escalated       bool       `json:"escalated"`
 	SessionID       string     `json:"session_id"`
 	OwnerID         string     `json:"-"`
 	WorkDir         string     `json:"-"`
@@ -44,6 +48,8 @@ type TaskSnapshot struct {
 }
 
 type taskSession struct {
+	profile      string
+	escalated    bool
 	mu           sync.Mutex
 	sessionID    string
 	ownerID      string
@@ -59,6 +65,7 @@ type taskSession struct {
 	done         chan struct{}
 	outputNotify chan struct{}
 	serverCursor int64
+	cleanup      func()
 }
 
 type taskOutputWriter struct {
@@ -97,6 +104,41 @@ func NewTaskManager() *TaskManager {
 }
 
 func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command string) (string, error) {
+	prepared, cleanup, err := sandbox.Prepare(context.Background(), sandbox.SpawnRequest{Argv: []string{"/bin/bash", "-c", command}, Dir: workDir, Profile: &sandbox.Profile{Name: ":danger-full-access", FullAccess: true}})
+	if err != nil {
+		return "", err
+	}
+	return m.start(ctx, ownerID, workDir, command, prepared, cleanup, TaskPermissions{Profile: ":danger-full-access", Escalated: true})
+}
+
+type TaskPermissions struct {
+	Profile   string
+	Escalated bool
+}
+
+// StartPrepared starts a command that has already been wrapped by the sandbox
+// backend. TaskManager still owns its output pipes, process group and wait.
+func (m *TaskManager) StartPrepared(ctx context.Context, ownerID, workDir, command string, prepared *exec.Cmd, cleanup func(), metadata ...TaskPermissions) (string, error) {
+	if prepared == nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return "", errors.New("预构造命令不能为空")
+	}
+	permissions := TaskPermissions{}
+	if len(metadata) > 0 {
+		permissions = metadata[0]
+	}
+	return m.start(ctx, ownerID, workDir, command, prepared, cleanup, permissions)
+}
+
+func (m *TaskManager) start(ctx context.Context, ownerID, workDir, command string, prepared *exec.Cmd, cleanup func(), permissions TaskPermissions) (string, error) {
+	transferred := false
+	defer func() {
+		if !transferred && cleanup != nil {
+			cleanup()
+		}
+	}()
 	if command == "" {
 		return "", errors.New("命令不能为空")
 	}
@@ -143,7 +185,10 @@ func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command strin
 	if err != nil {
 		return "", fmt.Errorf("生成会话 ID 失败: %w", err)
 	}
-	cmd := exec.Command("bash", "-c", command)
+	cmd := prepared
+	if cmd == nil {
+		return "", errors.New("命令未经过 Prepare，已拒绝执行")
+	}
 	cmd.Dir = workDir
 	cmd.WaitDelay = 2 * time.Second
 	configureProcess(cmd)
@@ -156,6 +201,7 @@ func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command strin
 	}
 
 	session := &taskSession{
+		profile: permissions.Profile, escalated: permissions.Escalated,
 		sessionID:    id,
 		ownerID:      ownerID,
 		workDir:      workDir,
@@ -166,7 +212,9 @@ func (m *TaskManager) Start(ctx context.Context, ownerID, workDir, command strin
 		log:          logBuffer,
 		done:         make(chan struct{}),
 		outputNotify: outputNotify,
+		cleanup:      cleanup,
 	}
+	transferred = true
 	m.mu.Lock()
 	evicted := m.pruneFinishedLocked()
 	m.sessions[id] = session
@@ -207,6 +255,11 @@ func (m *TaskManager) pruneFinishedLocked() *taskSession {
 }
 
 func (m *TaskManager) wait(session *taskSession) {
+	defer func() {
+		if session.cleanup != nil {
+			session.cleanup()
+		}
+	}()
 	_ = session.cmd.Wait()
 	now := time.Now()
 	session.mu.Lock()
@@ -301,6 +354,7 @@ func (m *TaskManager) snapshotAt(session *taskSession, maxOutput int, cursor *in
 	session.mu.Lock()
 	status := session.status
 	snapshot := TaskSnapshot{
+		Profile: session.profile, Escalated: session.escalated,
 		SessionID:  session.sessionID,
 		OwnerID:    session.ownerID,
 		WorkDir:    session.workDir,
@@ -347,6 +401,7 @@ func (m *TaskManager) List(ownerID, workDir string) ([]TaskSnapshot, error) {
 		}
 		session.mu.Lock()
 		result = append(result, TaskSnapshot{
+			Profile: session.profile, Escalated: session.escalated,
 			SessionID:  session.sessionID,
 			OwnerID:    session.ownerID,
 			WorkDir:    session.workDir,
