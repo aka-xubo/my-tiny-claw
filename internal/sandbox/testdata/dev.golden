@@ -1,0 +1,38 @@
+(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow signal (target self))
+(allow signal (target same-sandbox))
+(allow sysctl-read)
+(allow file-read-metadata)
+(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))
+(allow ipc-posix-sem)
+(allow ipc-posix-shm)
+(allow pseudo-tty)
+(allow file-read* file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty"))
+(allow file-read* (require-all (subpath (param "PATH_0")) (require-not (subpath (param "PATH_1"))) (require-not (subpath (param "PATH_2"))) (require-not (subpath (param "PATH_3"))) (require-not (regex (param "PATH_4"))) (require-not (regex (param "PATH_5"))) (require-not (subpath (param "PATH_6")))))
+(allow file-read* file-write* (require-all (subpath (param "PATH_2")) (require-not (regex (param "PATH_4"))) (require-not (regex (param "PATH_5")))))
+(allow file-read* file-write* (require-all (subpath (param "PATH_3")) (require-not (regex (param "PATH_4"))) (require-not (regex (param "PATH_5"))) (require-not (subpath (param "PATH_6")))))
+(allow file-read* (require-all (regex (param "PATH_5")) (require-not (regex (param "PATH_4")))))
+(allow file-read* (require-all (subpath (param "PATH_6")) (require-not (regex (param "PATH_4"))) (require-not (regex (param "PATH_5")))))
+(deny file-write-unlink (literal (param "PATH_7")))
+(allow network-outbound (remote ip "localhost:12345") (remote ip "localhost:12346"))
+
+# argv
+-D
+PATH_0=/
+-D
+PATH_1=/home/user/.claw/mcp-oauth.json
+-D
+PATH_2=/private/tmp
+-D
+PATH_3=/workspace
+-D
+PATH_4=^/workspace/(.*/)?[^/]*\.env(/.*)?$
+-D
+PATH_5=^/workspace/config/.*(/.*)?$
+-D
+PATH_6=/workspace/.git
+-D
+PATH_7=/workspace

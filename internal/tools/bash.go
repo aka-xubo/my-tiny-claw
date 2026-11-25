@@ -6,26 +6,39 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os/exec"
+	"strings"
 	"time"
 
+	"github.com/aka-xubo/my-tiny-claw/internal/sandbox"
 	"github.com/aka-xubo/my-tiny-claw/internal/schema"
 )
 
 type BashTool struct {
-	workDir  string
-	manager  *TaskManager
-	readOnly bool
+	workDir    string
+	manager    *TaskManager
+	readOnly   bool
+	session    *sandbox.Session
+	sessionErr error
 }
 
 // NewBashTool keeps the original one-shot behavior for embedded callers and
 // read-only subagents. The main agent should use NewManagedBashTool.
 func NewBashTool(workDir string) *BashTool {
-	return &BashTool{workDir: workDir}
+	session, err := defaultSandboxSession(workDir)
+	return &BashTool{workDir: workDir, session: session, sessionErr: err}
 }
 
 func NewManagedBashTool(workDir string, manager *TaskManager) *BashTool {
-	return &BashTool{workDir: workDir, manager: manager}
+	session, err := defaultSandboxSession(workDir)
+	return &BashTool{workDir: workDir, manager: manager, session: session, sessionErr: err}
+}
+
+func NewBashToolWithSandbox(workDir string, session *sandbox.Session) *BashTool {
+	return &BashTool{workDir: workDir, session: session}
+}
+
+func NewManagedBashToolWithSandbox(workDir string, manager *TaskManager, session *sandbox.Session) *BashTool {
+	return &BashTool{workDir: workDir, manager: manager, session: session}
 }
 
 func (t *BashTool) Name() string {
@@ -34,10 +47,11 @@ func (t *BashTool) Name() string {
 
 func (t *BashTool) Definition() schema.ToolDefinition {
 	description := "在当前工作区执行 bash 命令。短命令直接返回；需要持续运行的命令会返回 session_id，可使用 poll、list、stop 查看或管理后台会话。"
+	description += "访问范围由沙箱权限档控制；默认宽泛读取的内容会进入模型上下文。proxy 模式下程序必须支持代理变量，Go net/http 对 localhost 默认不走代理。预先存在的硬链接原地写入可能影响工作区外文件。"
 	if t.readOnly {
 		description = "在只读隔离中同步执行 bash 搜索与读取命令，最多运行 30 秒。禁止文件写入和网络访问，也不能在 /tmp 等目录创建临时文件；mktemp、需要临时文件的部分 go 子命令会失败。不支持后台会话。"
 	}
-	return schema.ToolDefinition{
+	result := schema.ToolDefinition{
 		Name:        t.Name(),
 		Description: description,
 		InputSchema: map[string]interface{}{
@@ -58,6 +72,9 @@ func (t *BashTool) Definition() schema.ToolDefinition {
 			},
 		},
 	}
+	root := result.InputSchema.(map[string]interface{})
+	addSandboxProperties(root["properties"].(map[string]interface{}))
+	return result
 }
 
 type bashArgs struct {
@@ -67,6 +84,7 @@ type bashArgs struct {
 	YieldTimeMS    *int   `json:"yield_time_ms"`
 	Cursor         *int64 `json:"cursor"`
 	MaxOutputBytes int    `json:"max_output_bytes"`
+	sandboxToolArgs
 }
 
 type bashResponse struct {
@@ -76,12 +94,24 @@ type bashResponse struct {
 }
 
 func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	if t.sessionErr != nil {
+		return "", t.sessionErr
+	}
+	if t.session == nil {
+		return "", fmt.Errorf("沙箱会话未初始化，已拒绝执行")
+	}
 	var input bashArgs
 	if err := json.Unmarshal(args, &input); err != nil {
 		if t.manager != nil {
 			return managedError(1, fmt.Sprintf("参数解析失败: %v", err)), nil
 		}
 		return "", fmt.Errorf("参数解析失败: %w", err)
+	}
+	if t.readOnly && input.SandboxPermissions != "" && input.SandboxPermissions != sandbox.UseDefault {
+		return "", fmt.Errorf("子 Agent 不允许申请额外权限或完全提权")
+	}
+	if input.Action != "" && (input.SandboxPermissions != "" || input.Justification != "" || input.AdditionalPermissions != nil) {
+		return "", fmt.Errorf("会话管理调用不接受权限参数")
 	}
 	if t.manager == nil {
 		if input.Action != "" || input.SessionID != "" {
@@ -90,7 +120,7 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		if input.Command == "" {
 			return "", fmt.Errorf("command 不能为空")
 		}
-		return t.executeSync(ctx, input.Command)
+		return t.executeSync(ctx, input)
 	}
 	output, err := t.executeManaged(ctx, input)
 	if err != nil {
@@ -153,12 +183,30 @@ func (t *BashTool) executeManaged(ctx context.Context, input bashArgs) (string, 
 		if err != nil {
 			return managedError(1, err.Error()), nil
 		}
-		return encodeBashResponse(bashResponse{Code: 0, Message: "会话输出", Data: snapshot})
+		return encodeBashResponse(bashResponse{Code: 0, Message: "会话输出", Data: withSandboxHint(snapshot)})
 	default:
 		if input.Command == "" {
 			return "", fmt.Errorf("command 不能为空")
 		}
-		sessionID, err := t.manager.Start(ctx, ownerID, workDir, input.Command)
+		var sessionID string
+		{
+			call, authorizeErr := input.sandboxToolArgs.call("bash", input.Command, workDir, "command", "")
+			if authorizeErr != nil {
+				return "", authorizeErr
+			}
+			profile, authorizeErr := t.session.Authorize(ctx, call)
+			if authorizeErr != nil {
+				return "", authorizeErr
+			}
+			prepared, cleanup, prepareErr := t.session.Spawn(t.session.Context(), []string{"/bin/bash", "-c", input.Command}, workDir, profile)
+			if prepareErr != nil {
+				return "", prepareErr
+			}
+			sessionID, err = t.manager.StartPrepared(ctx, ownerID, workDir, input.Command, prepared, cleanup, TaskPermissions{Profile: profile.Name, Escalated: profile.FullAccess})
+			if err == nil {
+				t.session.RecordProxySource(profile, input.Command, workDir, sessionID)
+			}
+		}
 		if err != nil {
 			code := 1
 			if errors.Is(err, ErrTaskStart) {
@@ -177,53 +225,35 @@ func (t *BashTool) executeManaged(ctx context.Context, input bashArgs) (string, 
 		if snapshot.Status == TaskRunning {
 			message = "命令仍在运行，已返回会话"
 		}
-		return encodeBashResponse(bashResponse{Code: 0, Message: message, Data: snapshot})
+		return encodeBashResponse(bashResponse{Code: 0, Message: message, Data: withSandboxHint(snapshot)})
 	}
 }
 
-func (t *BashTool) executeSync(ctx context.Context, command string) (string, error) {
-	if t.readOnly {
-		return t.executeReadOnly(ctx, command)
+func withSandboxHint(snapshot TaskSnapshot) TaskSnapshot {
+	if !snapshot.Escalated && snapshot.ExitCode != nil && *snapshot.ExitCode != 0 && strings.Contains(snapshot.Output, "Operation not permitted") {
+		snapshot.Output += "\n[sandbox] 命令可能被沙箱拦截（权限档 " + snapshot.Profile + "）。如确实需要，可用 sandbox_permissions 申请扩大权限后重试。"
 	}
+	return snapshot
+}
 
+func (t *BashTool) executeSync(ctx context.Context, input bashArgs) (string, error) {
+	call, err := input.sandboxToolArgs.call("bash", input.Command, t.workDir, "command", "")
+	if err != nil {
+		return "", err
+	}
+	profile, err := t.session.Authorize(ctx, call)
+	if err != nil {
+		return "", err
+	}
+	// Waiting for a human is not part of the command's execution timeout.
 	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-
-	// 在 macOS/Linux 下，我们通过将指令包裹在 `bash -c` 中执行，以支持环境变量、管道和逻辑与(&&)等复杂 Shell 语法。
-	cmd := exec.CommandContext(timeoutCtx, "bash", "-c", command)
-
-	// 【驾驭底线 2】：绑定执行的工作区目录
-	// 确保命令默认在用户指定的 WorkDir 下执行，而不是引擎启动时的绝对路径。
-	cmd.Dir = t.workDir
-
-	// 执行并捕获 CombinedOutput (合并 stdout 和 stderr)
-	out, err := cmd.CombinedOutput()
-	outputStr := string(out)
-
-	// 如果命令执行超时，返回警告信息让模型知晓
-	if timeoutCtx.Err() == context.DeadlineExceeded {
-		return outputStr + "\n[警告: 命令执行超时(30s)，已被系统强制终止。]", nil
-	}
-
-	// 【驾驭底线 3】：错误原样回传 (Self-Correction 自愈机制)
-	// 当 bash 报错时（err != nil），我们绝对不能返回 Go 的 error 阻断程序！
-	// 我们必须把 err 和 outputStr 拼接成字符串返回，利用大模型的自纠错能力自己分析报错！
+	cmd, cleanup, err := t.session.Spawn(timeoutCtx, []string{"/bin/bash", "-c", input.Command}, t.workDir, profile)
 	if err != nil {
-		return fmt.Sprintf("执行报错: %v\n输出:\n%s", err, outputStr), nil
+		return "", err
 	}
-
-	// 如果没有终端输出（比如仅仅执行了 mkdir），给模型一个明确的执行成功的反馈
-	if outputStr == "" {
-		return "命令执行成功，无终端输出。", nil
-	}
-
-	// 【驾驭底线 4】：长度截断保护 (防 OOM)
-	const maxLen = 8000
-	if len(outputStr) > maxLen {
-		return fmt.Sprintf("%s\n\n...[终端输出过长，已截断至前 %d 字节]...", outputStr[:maxLen], maxLen), nil
-	}
-
-	return outputStr, nil
+	defer cleanup()
+	return runSyncCommand(timeoutCtx, cmd, profile.Name)
 }
 
 func parseYieldTime(value *int, poll bool) (time.Duration, error) {

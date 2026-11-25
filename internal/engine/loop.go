@@ -15,13 +15,14 @@ import (
 )
 
 type AgentEngine struct {
-	provider       provider.LLMProvider
-	registry       tools.Registry
-	EnableThinking bool
-	PlanMode       bool // 【新增】暴露给外部的计划模式开关
-	compactor      *cctx.Compactor
-	recovery       *cctx.RecoveryManager
-	injector       *ReminderInjector // 【新增】提醒注入器
+	provider           provider.LLMProvider
+	registry           tools.Registry
+	EnableThinking     bool
+	PlanMode           bool // 【新增】暴露给外部的计划模式开关
+	SandboxDescription string
+	compactor          *cctx.Compactor
+	recovery           *cctx.RecoveryManager
+	injector           *ReminderInjector // 【新增】提醒注入器
 }
 
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, planMode bool, enableThinking bool) *AgentEngine {
@@ -52,7 +53,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *cctx.Session, reporter R
 		_ = observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID)
 		log.Printf("📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下\n")
 	}()
-	composer := cctx.NewPromptComposer(session.WorkDir, e.PlanMode)
+	composer := cctx.NewPromptComposerWithSandbox(session.WorkDir, e.PlanMode, e.SandboxDescription)
 	systemMsg := composer.Build()
 	turnCount := 0
 	for {

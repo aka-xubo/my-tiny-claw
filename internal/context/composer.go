@@ -14,6 +14,7 @@ type PromptComposer struct {
 	workDir     string
 	planMode    bool // 【新增】计划模式开关
 	skillLoader *SkillLoader
+	sandboxInfo string
 }
 
 func NewPromptComposer(workDir string, planMode bool) *PromptComposer {
@@ -22,6 +23,12 @@ func NewPromptComposer(workDir string, planMode bool) *PromptComposer {
 		planMode:    planMode,
 		skillLoader: NewSkillLoader(workDir),
 	}
+}
+
+func NewPromptComposerWithSandbox(workDir string, planMode bool, sandboxInfo string) *PromptComposer {
+	composer := NewPromptComposer(workDir, planMode)
+	composer.sandboxInfo = sandboxInfo
+	return composer
 }
 
 func (c *PromptComposer) Build() schema.Message {
@@ -39,6 +46,11 @@ func (c *PromptComposer) Build() schema.Message {
 5. 遇到工具执行报错时，仔细阅读 stderr，尝试自己修正命令并重试。
 6. 始终用中文回复，以便传达你的进展和想法。
 `)
+	if c.sandboxInfo != "" {
+		promptBuilder.WriteString("\n# 沙箱环境\n")
+		promptBuilder.WriteString(c.sandboxInfo)
+		promptBuilder.WriteString("\n如果默认权限不足，必须在工具参数中显式申请额外权限并说明理由；系统不会根据权限错误自动提权。\n")
+	}
 
 	if c.planMode {
 		// 【核心重构】：引入状态嗅探与断点续传的条件分支逻辑

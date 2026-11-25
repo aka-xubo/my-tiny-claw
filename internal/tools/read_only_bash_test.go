@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,12 +20,19 @@ import (
 
 func requireReadOnlySandbox(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS == "linux" {
-		if _, err := os.Stat("/usr/bin/bwrap"); err != nil {
-			t.Skip("bubblewrap not installed; tool fails closed on this host")
+	if runtime.GOOS != "darwin" {
+		t.Skip("restricted profiles are unsupported and fail closed on this host")
+	} else {
+		// sandbox-exec may exist while the surrounding CI/Codex sandbox forbids
+		// sandbox_apply. Probe the actual operation before running integration
+		// assertions; production code still fails closed in this situation.
+		cmd := exec.Command("/usr/bin/sandbox-exec", "-p", "(version 1) (deny default) (allow process-exec) (allow file-read*)", "/usr/bin/true")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			if strings.Contains(string(output), "sandbox_apply: Operation not permitted") && os.Getenv("CLAW_REQUIRE_SEATBELT") != "1" {
+				t.Skipf("host forbids sandbox_apply: %v (%s)", err, output)
+			}
+			t.Fatalf("sandbox-exec probe failed: %v (%s)", err, output)
 		}
-	} else if runtime.GOOS != "darwin" {
-		t.Skip("read-only bash is unsupported and fails closed on this host")
 	}
 }
 
@@ -84,6 +93,9 @@ func TestReadOnlyBashPreprocessorCannotEscapeSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := exec.LookPath("rg"); err != nil {
+		if os.Getenv("CLAW_REQUIRE_TOOLCHAINS") == "1" {
+			t.Fatal(err)
+		}
 		t.Skip("ripgrep not installed")
 	}
 	args, _ := json.Marshal(bashArgs{Command: `rg --pre ./evil.sh foo input.txt`})
@@ -133,10 +145,20 @@ func TestReadOnlyBashDeniesTCPAndHostUnixSockets(t *testing.T) {
 		t.Run(network, func(t *testing.T) {
 			address := "127.0.0.1:0"
 			if network == "unix" {
-				address = filepath.Join(t.TempDir(), "test.sock")
+				// macOS sockaddr_un limits socket paths to 104 bytes. Go's
+				// per-test directory includes the test name and can exceed it.
+				dir, err := os.MkdirTemp("/tmp", "claw-sock-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.RemoveAll(dir) })
+				address = filepath.Join(dir, "test.sock")
 			}
 			listener, err := net.Listen(network, address)
 			if err != nil {
+				if (errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)) && os.Getenv("CLAW_REQUIRE_SEATBELT") != "1" {
+					t.Skipf("host forbids %s listener: %v", network, err)
+				}
 				t.Fatal(err)
 			}
 			defer listener.Close()
